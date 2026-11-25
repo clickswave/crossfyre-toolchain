@@ -66,6 +66,15 @@ pub fn is_internal_literal(host: &str) -> bool {
     bare.parse::<IpAddr>().is_ok_and(|ip| is_internal(&ip))
 }
 
+/// Does `host`, as a URL spells it, name this machine or its network outright: an
+/// internal address, or `localhost` and the names under it, which a browser and most
+/// resolvers answer with loopback without asking any DNS server. A trailing dot names
+/// the same host.
+pub fn is_internal_host(host: &str) -> bool {
+    let host = host.strip_suffix('.').unwrap_or(host).to_ascii_lowercase();
+    is_internal_literal(&host) || host == "localhost" || host.ends_with(".localhost")
+}
+
 /// Resolve `host` and keep only the addresses that are safe to dial.
 ///
 /// Shared by both backend impls below and by [`crate::dial`], so the filtering

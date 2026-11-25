@@ -1817,7 +1817,7 @@ fn resolve_and_scope(raw: &str, base: &Url, params: &CrawlParams, seed_host: &st
     // to the node's own network: a page or a redirect that names a loopback,
     // private or link-local address is not an external site. The operator can
     // still list such a host.
-    let in_scope = listed || (params.follow_external && !is_internal_host(&host));
+    let in_scope = listed || (params.follow_external && !transport::guard::is_internal_host(&host));
     if !in_scope {
         return None;
     }
@@ -1839,14 +1839,6 @@ fn resolve_and_scope(raw: &str, base: &Url, params: &CrawlParams, seed_host: &st
     }
 
     Some(url)
-}
-
-/// A host that names this machine or its network outright: an internal address
-/// literal, or `localhost` and its subdomains, which resolve to loopback.
-fn is_internal_host(host: &str) -> bool {
-    transport::guard::is_internal_literal(host)
-        || host == "localhost"
-        || host.ends_with(".localhost")
 }
 
 fn query_keys(url: &Url) -> Vec<String> {
@@ -2576,6 +2568,7 @@ mod redirect_tests {
             "http://169.254.169.254/latest/meta-data/",
             "http://[::1]/",
             "http://localhost:3000/",
+            "http://localhost.:3000/",
             "http://api.localhost/",
         ] {
             assert_eq!(

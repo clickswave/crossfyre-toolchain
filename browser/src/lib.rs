@@ -369,17 +369,15 @@ pub struct Visit {
 pub type Gate = std::sync::Arc<dyn Fn(&str) -> bool + Send + Sync>;
 
 /// Whether a request a page makes itself is failed whatever the scope says: one that
-/// is not http or https, or names an internal address outright. A page's own data and
-/// blob URLs never leave the browser, so they are let be.
+/// is not http or https, or names an internal address or `localhost` outright. A page's
+/// own data and blob URLs never leave the browser, so they are let be.
 fn refused_outright(url: &str) -> bool {
     let Ok(u) = transport::Url::parse(url) else {
         return true;
     };
     match u.scheme() {
         "data" | "blob" => false,
-        "http" | "https" => u
-            .host_str()
-            .is_none_or(transport::guard::is_internal_literal),
+        "http" | "https" => u.host_str().is_none_or(transport::guard::is_internal_host),
         _ => true,
     }
 }
@@ -1088,8 +1086,8 @@ mod tests {
     }
 
     /// A request a page makes itself is failed outright when it is not http or https,
-    /// or names an internal address; a page's own data and blob URLs never leave the
-    /// browser.
+    /// or names an internal address or `localhost`; a page's own data and blob URLs
+    /// never leave the browser.
     #[test]
     fn a_subresource_is_refused_by_its_scheme_or_an_internal_address() {
         for refused in [
@@ -1097,6 +1095,10 @@ mod tests {
             "http://169.254.169.254/latest/meta-data/",
             "http://[::1]/",
             "https://10.0.0.5/app.js",
+            // Names that resolve to loopback without asking any DNS server.
+            "http://localhost:8080/admin",
+            "http://LOCALHOST./",
+            "http://app.localhost/api",
             "ftp://cdn.example.test/file",
             "file:///etc/passwd",
         ] {
