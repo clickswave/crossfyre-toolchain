@@ -885,6 +885,7 @@ dependencies = [
  "cfx_cve",
  "cfx_policy",
  "cfx_scope",
+ "cfx_untrusted",
  "chrono",
  "dguard",
  "libc",
@@ -975,6 +976,7 @@ dependencies = [
 name = "cfx_tui"
 version = "0.1.0"
 dependencies = [
+ "cfx_untrusted",
  "crossterm",
  "ratatui",
  "serde_json",
@@ -991,6 +993,13 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "webpki-roots 1.0.10",
+]
+
+[[package]]
+name = "cfx_untrusted"
+version = "0.0.1"
+dependencies = [
+ "regex",
 ]
 
 [[package]]

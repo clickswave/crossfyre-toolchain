@@ -25,6 +25,9 @@ cfx_policy = { path = "../policy" }
 # What toolmark's inventory says of a host, and the words for the answers to its CVE
 # leads, read as the node and `plessor scan` read them.
 cfx_cve = { path = "../cve" }
+# What a scanned system wrote, stripped of what a terminal or renderer acts on or
+# hides. The TUI strips the same characters, so the two cannot drift apart.
+cfx_untrusted = { path = "../untrusted" }
 # HTTPS to the Cloud API: the reqwest and rustls that transport already brings, so
 # there is no second TLS stack, with no redirect ever followed.
 reqwest = { version = "0.12.22", default-features = false, features = ["rustls-tls"] }

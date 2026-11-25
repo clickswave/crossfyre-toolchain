@@ -41,10 +41,17 @@ pub struct Cell {
     pub chip: bool,
 }
 
+/// What a cell may show of `text`: none of what a terminal would act on or hide,
+/// and on one line. A line break in a copied row goes wherever it is pasted, a
+/// shell prompt included.
+fn shown(text: &str) -> String {
+    cfx_untrusted::strip(text).replace(['\n', '\t'], " ")
+}
+
 impl Cell {
     pub fn toned(text: impl Into<String>, tone: Tone) -> Self {
         Self {
-            text: text.into(),
+            text: shown(&text.into()),
             tone,
             chip: false,
         }
@@ -61,7 +68,7 @@ impl Cell {
     /// A severity, in its tone. Low and above are chips, so they stand out of a
     /// list that is mostly informational, which is left as quiet text.
     pub fn severity(severity: impl Into<String>) -> Self {
-        let text = severity.into();
+        let text = shown(&severity.into());
         Self {
             tone: theme::severity(&text),
             chip: matches!(text.as_str(), "critical" | "high" | "medium" | "low"),
@@ -71,7 +78,7 @@ impl Cell {
 
     /// An HTTP status, toned by its class.
     pub fn status_code(code: impl Into<String>) -> Self {
-        let text = code.into();
+        let text = shown(&code.into());
         Self {
             tone: theme::status_code(&text),
             text,
@@ -320,6 +327,23 @@ pub fn draw(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A cell's text is mostly what a scanned target wrote: a title, a banner, a
+    /// server header. What a terminal would act on or hide goes before it is drawn
+    /// or copied, and so does a line break, which a copied row would take with it
+    /// into wherever it is pasted.
+    #[test]
+    fn a_cell_keeps_only_what_shows() {
+        let raw = "a\x1b[31mred\x1b[0m\x1b]8;;http://x.test\x07link\u{202E}b\u{200B}c\r\nd\te";
+        for cell in [
+            Cell::plain(raw),
+            Cell::muted(raw),
+            Cell::severity(raw),
+            Cell::status_code(raw),
+        ] {
+            assert_eq!(cell.text, "aredlinkbc d e");
+        }
+    }
 
     fn rows(names: &'static [&'static str]) -> impl Fn(usize) -> Vec<Cell> {
         move |i| vec![Cell::plain(names[i])]
