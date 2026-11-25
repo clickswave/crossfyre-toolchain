@@ -154,7 +154,8 @@ pub fn helper_command(helper: &Path) -> std::process::Command {
 /// and then on PATH. A Python is looked for, in order, as the embeddable package in a
 /// `python` folder beside the helper, which a release can ship so that nothing has to
 /// be installed, then among the installs registered under PEP 514 (python.org's
-/// installer, among others), newest first. The one found goes at the front of PATH, and
+/// installer, among others), newest first, and when elevated only among those
+/// registered for every user. The one found goes at the front of PATH, and
 /// becomes PYTHONHOME for a registered install, so its own standard library is the one
 /// loaded.
 fn python_env(helper: &Path) -> (Vec<(OsString, OsString)>, Option<PathBuf>) {
@@ -193,8 +194,15 @@ fn find_python(helper: &Path) -> Option<(PathBuf, bool)> {
     // `3.12`, and `3.12-32` or `3.12-arm64` for other architectures, which this
     // 64-bit x86 helper cannot load.
     const CORE: &str = r"SOFTWARE\Python\PythonCore";
+    // Elevated, the user's own hive is not read: any program the user runs without
+    // elevation can write it, and the Python it names would be loaded elevated.
+    let hives: &[Hive] = if crate::os::is_elevated() {
+        &[Hive::LocalMachine]
+    } else {
+        &[Hive::CurrentUser, Hive::LocalMachine]
+    };
     let mut found: Vec<((u32, u32), PathBuf)> = Vec::new();
-    for hive in [Hive::CurrentUser, Hive::LocalMachine] {
+    for &hive in hives {
         for tag in reg_subkeys(hive, CORE) {
             let Some((major, minor)) = tag.split_once('.') else {
                 continue;
