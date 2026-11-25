@@ -47,7 +47,7 @@ jobs:
     name: open-core boundary
     runs-on: ubuntu-26.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: The authorization drop-in must not be committed
         run: |
@@ -89,13 +89,13 @@ jobs:
     # that image's Python 3.12. Moving to the next image should be a commit.
     runs-on: ubuntu-26.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       # cfx-script links libpython on Linux. Without PYO3_PYTHON, pyo3 runs the first
       # python3 on PATH and only rebuilds when PATH itself changes, not when the image
       # swaps the interpreter behind it. 3.13 is the minor version the Linux release
       # ships with cfx-script (LINUX_PYTHON in release.yml).
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         id: python
         with:
           python-version: "3.13"
@@ -126,7 +126,7 @@ jobs:
           rustc --version && cargo --version
 
       - name: Cache cargo
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             ~/.cargo/registry/index
@@ -191,9 +191,9 @@ jobs:
     env:
       MACOSX_DEPLOYMENT_TARGET: "11.0"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         id: python
         with:
           python-version: "3.12"
@@ -214,7 +214,7 @@ jobs:
           echo "C:\\Program Files\\NASM" >> "$GITHUB_PATH"
 
       - name: Cache cargo
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             ~/.cargo/registry/index
@@ -301,7 +301,7 @@ jobs:
     # negative result gets no scrutiny, so each case asserts what must NOT be
     # reported as well as what must.
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Install Rust
         run: |
@@ -313,7 +313,7 @@ jobs:
         run: echo "image=$ImageOS" >> "$GITHUB_OUTPUT"
 
       - name: Cache cargo
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             ~/.cargo/registry/index
@@ -370,7 +370,7 @@ jobs:
     # resolves module paths without evaluating cfg, so it hard-errored on the
     # private path a public checkout lacks.
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Install Rust with rustfmt
         run: |
           rustup toolchain install 1.88.0 --profile minimal --component rustfmt --no-self-update
@@ -386,7 +386,7 @@ jobs:
     # carries a comment saying why, so a future warning means new code, not
     # inherited debt.
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Install Rust with lint components
         run: |
@@ -395,7 +395,7 @@ jobs:
 
       # As in the build job: cfx-script's pyo3 is checked against a named Python, and
       # the cache follows the image and that Python.
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         id: python
         with:
           python-version: "3.13"
@@ -407,7 +407,7 @@ jobs:
           echo "image=$ImageOS" >> "$GITHUB_OUTPUT"
 
       - name: Cache cargo
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             ~/.cargo/registry/index
@@ -488,7 +488,7 @@ jobs:
     # feature that only arm64 shows would otherwise first appear in an arm64 release
     # build.
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Install Rust and the BoringSSL build tools
         run: |
@@ -505,7 +505,7 @@ jobs:
           rustc --version && cargo --version
 
       - name: Cache cargo
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             ~/.cargo/registry/index
@@ -621,7 +621,7 @@ jobs:
     # right place to decide whether to upgrade, ignore, or drop a dependency.
     continue-on-error: ${{ github.event_name != 'schedule' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked
       # The ignore of RUSTSEC-2026-0459 below holds only while no build compiles

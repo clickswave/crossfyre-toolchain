@@ -1,0 +1,23 @@
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    target-branch: dev
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        update-types: [minor, patch]
+
+  - package-ecosystem: cargo
+    directory: /
+    target-branch: dev
+    schedule:
+      interval: weekly
+    groups:
+      crates:
+        update-types: [minor, patch]
+    ignore:
+      # Pinned in mcp/Cargo.toml: the protocol layer moves on purpose, with the
+      # tools/list snapshot test updated in the same change.
+      - dependency-name: rmcp
