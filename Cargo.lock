@@ -5554,6 +5554,7 @@ dependencies = [
  "cfx_tunnel",
  "clap",
  "clap_complete",
+ "clap_mangen",
  "dguard",
  "flate2",
  "md5",
