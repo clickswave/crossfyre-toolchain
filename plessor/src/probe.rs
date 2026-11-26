@@ -1089,8 +1089,8 @@ mod oast_client_tests {
     async fn self_signed_api() -> (u16, Arc<std::sync::atomic::AtomicUsize>) {
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).expect("mint");
         let der = rustls::pki_types::CertificateDer::from(cert.cert.der().to_vec());
-        let key =
-            rustls::pki_types::PrivateKeyDer::try_from(cert.signing_key.serialize_der()).expect("key");
+        let key = rustls::pki_types::PrivateKeyDer::try_from(cert.signing_key.serialize_der())
+            .expect("key");
         let config = rustls::ServerConfig::builder_with_provider(Arc::new(
             rustls::crypto::aws_lc_rs::default_provider(),
         ))

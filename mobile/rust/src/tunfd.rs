@@ -20,7 +20,7 @@ static HELD: Mutex<Option<i32>> = Mutex::new(None);
 
 /// Held by every test that takes or lets go of the tunnel, since the hold is
 /// process-global and tests run on several threads.
-#[cfg(test)]
+#[cfg(all(test, any(target_os = "linux", target_os = "android")))]
 pub static TEST_LOCK: Mutex<()> = Mutex::new(());
 
 fn held() -> std::sync::MutexGuard<'static, Option<i32>> {

@@ -209,6 +209,7 @@ pub const PROFILE_PREFERENCES: &str = r#"{"net":{"network_prediction_options":2}
 /// directory that is already at the path, which another account could have made, is
 /// an error rather than a profile.
 fn write_profile(profile: &std::path::Path) -> std::io::Result<()> {
+    #[cfg_attr(not(unix), allow(unused_mut))]
     let mut dir = std::fs::DirBuilder::new();
     #[cfg(unix)]
     std::os::unix::fs::DirBuilderExt::mode(&mut dir, 0o700);
