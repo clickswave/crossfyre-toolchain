@@ -38,8 +38,13 @@ impl TunDevice {
         let flags = unsafe { libc_fcntl_getfl(dup_fd) };
         unsafe { libc_fcntl_setfl(dup_fd, flags | O_NONBLOCK) };
         let owned = unsafe { OwnedFd::from_raw_fd(dup_fd) };
+        // SAFETY: the AsyncFd owns `owned`, so the fd stays open, under the same
+        // number, until the AsyncFd is dropped. `tunfd::release` can point that
+        // number at /dev/null while it is registered; reads and writes then fail
+        // or end, which is how Stop lets go of the tunnel.
+        let registered = unsafe { AsyncFd::register(owned) }?;
         let device = Self {
-            inner: Some(AsyncFd::new(owned)?),
+            inner: Some(registered),
             fd: dup_fd,
         };
         // Recorded so Stop can let go of the tunnel without waiting for this
