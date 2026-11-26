@@ -65,6 +65,9 @@ impl Toolmark {
                 match kind.as_str() {
                     "technology" => self.technologies += 1,
                     "vulnerability" => self.vulnerabilities += 1,
+                    // The run's record of what stands in front of the target, which
+                    // is not a service.
+                    "environment" => {}
                     _ => self.services += 1,
                 }
 
@@ -78,14 +81,21 @@ impl Toolmark {
                         (None, _) => range_text(&data["version_range"]),
                     },
                     "vulnerability" => data["cve"].as_str().unwrap_or("").to_string(),
+                    "environment" => match data["recommended_rate"].as_str() {
+                        Some(rate) => format!("rate {rate}"),
+                        None => String::new(),
+                    },
                     _ => data["server"].as_str().unwrap_or("").to_string(),
                 };
 
-                let mut name = data["name"]
-                    .as_str()
-                    .or_else(|| data["title"].as_str())
-                    .unwrap_or("-")
-                    .to_string();
+                let mut name = match kind.as_str() {
+                    "environment" => environment_name(data),
+                    _ => data["name"]
+                        .as_str()
+                        .or_else(|| data["title"].as_str())
+                        .unwrap_or("-")
+                        .to_string(),
+                };
                 // What could not be told apart from it, said with it.
                 let candidates: Vec<&str> = data["candidates"]
                     .as_array()
@@ -206,6 +216,19 @@ fn range_text(range: &Value) -> String {
     parts.join(", ")
 }
 
+/// What stands in front of the target, from the run's environment record: the WAF
+/// seen, if any, and the CDN it is behind.
+fn environment_name(data: &Value) -> String {
+    let waf = match data["waf_vendor"].as_str() {
+        Some(vendor) => format!("WAF: {vendor}"),
+        None => "No WAF seen".to_string(),
+    };
+    match data["cdn"].as_str() {
+        Some(cdn) => format!("{waf}, behind {cdn}"),
+        None => waf,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -263,5 +286,34 @@ mod tests {
         }
         let details: Vec<&str> = view.findings.iter().map(|f| f.detail.as_str()).collect();
         assert_eq!(details, ["8.9p1 (Ubuntu-3ubuntu0.6)", "8.9p1"]);
+    }
+
+    /// The run's environment record says what stood in front of the target, and is
+    /// not counted as a service.
+    #[test]
+    fn the_environment_record_says_what_stands_in_front_of_the_target() {
+        let mut view = Toolmark::new("http://example.test/".into());
+        for (waf, cdn, rate) in [
+            (json!(null), json!(null), "normal"),
+            (json!("Cloudflare"), json!("Cloudflare"), "low"),
+        ] {
+            view.apply(json!({"type": "finding", "data": {
+                "type": "environment", "severity": "info", "waf_vendor": waf, "cdn": cdn,
+                "recommended_rate": rate,
+            }}));
+        }
+        let rows: Vec<(&str, &str)> = view
+            .findings
+            .iter()
+            .map(|f| (f.name.as_str(), f.detail.as_str()))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                ("No WAF seen", "rate normal"),
+                ("WAF: Cloudflare, behind Cloudflare", "rate low")
+            ]
+        );
+        assert_eq!(view.services, 0);
     }
 }
