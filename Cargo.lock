@@ -110,7 +110,7 @@ checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
 
 [[package]]
 name = "ambulo"
-version = "0.0.27"
+version = "0.0.28"
 dependencies = [
  "adaptive",
  "base64 0.22.1",
@@ -3683,7 +3683,7 @@ checksum = "b4596b6d070b27117e987119b4dac604f3c58cfb0b191112e24771b2faeac1a6"
 
 [[package]]
 name = "plessor"
-version = "0.0.37"
+version = "0.0.38"
 dependencies = [
  "adaptive",
  "aes-gcm",
@@ -5665,7 +5665,7 @@ checksum = "009dbb7700f11c55ef83aebbe4c0e9cf1f1ac0844bd8d6f00dc38f302026e13a"
 
 [[package]]
 name = "toolmark"
-version = "0.0.19"
+version = "0.0.20"
 dependencies = [
  "adaptive",
  "base64 0.22.1",
