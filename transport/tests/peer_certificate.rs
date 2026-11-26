@@ -12,7 +12,7 @@ use transport::{Egress, ScanClient, build_scan_client, peer_certificate};
 fn certificate() -> (Vec<u8>, Arc<rustls::ServerConfig>) {
     let cert = rcgen::generate_simple_self_signed(vec!["app.example.test".into()]).unwrap();
     let der = cert.cert.der().to_vec();
-    let key = rustls::pki_types::PrivateKeyDer::try_from(cert.key_pair.serialize_der()).unwrap();
+    let key = rustls::pki_types::PrivateKeyDer::try_from(cert.signing_key.serialize_der()).unwrap();
     let cfg = rustls::ServerConfig::builder_with_provider(Arc::new(
         rustls::crypto::ring::default_provider(),
     ))

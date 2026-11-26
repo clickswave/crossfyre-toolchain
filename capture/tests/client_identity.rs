@@ -15,8 +15,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
 struct Ca {
-    cert: rcgen::Certificate,
-    key: rcgen::KeyPair,
+    issuer: rcgen::Issuer<'static, rcgen::KeyPair>,
     pem: String,
 }
 
@@ -27,9 +26,11 @@ fn a_ca() -> Ca {
     params
         .distinguished_name
         .push(rcgen::DnType::CommonName, "test ca");
-    let cert = params.self_signed(&key).expect("self signed");
-    let pem = cert.pem();
-    Ca { cert, key, pem }
+    let pem = params.self_signed(&key).expect("self signed").pem();
+    Ca {
+        issuer: rcgen::Issuer::new(params, key),
+        pem,
+    }
 }
 
 /// A certificate and key signed by `ca`, as PEM.
@@ -40,7 +41,7 @@ fn issue(cn: &str, ca: &Ca) -> (String, String) {
         .distinguished_name
         .push(rcgen::DnType::CommonName, cn);
     let cert = params
-        .signed_by(&key, &ca.cert, &ca.key)
+        .signed_by(&key, &ca.issuer)
         .expect("signed by the ca");
     (cert.pem(), key.serialize_pem())
 }

@@ -49,7 +49,8 @@ type BoxErr = Box<dyn Error + Send + Sync>;
 /// because the leaf is signed by a key the installed CA does not match.
 pub struct SessionCa {
     pub cert: rcgen::Certificate,
-    pub key: rcgen::KeyPair,
+    /// The CA's subject and signing key, which sign every leaf. `issuer.key()` is the key to persist.
+    pub issuer: rcgen::Issuer<'static, rcgen::KeyPair>,
     pub pem: String,
 }
 
@@ -87,19 +88,25 @@ pub fn ca_params() -> Result<rcgen::CertificateParams, BoxErr> {
 /// Mint a brand-new CA (new keypair). Callers that want persistence write `pem` + the key themselves.
 pub fn generate_ca() -> Result<SessionCa, BoxErr> {
     let key = rcgen::KeyPair::generate()?;
-    let cert = ca_params()?.self_signed(&key)?;
+    let params = ca_params()?;
+    let cert = params.self_signed(&key)?;
     let pem = cert.pem();
-    Ok(SessionCa { cert, key, pem })
+    Ok(SessionCa {
+        cert,
+        issuer: rcgen::Issuer::new(params, key),
+        pem,
+    })
 }
 
 /// Reconstruct a CA from a persisted cert PEM + key PEM. The issuer is re-derived from the fixed
 /// [`ca_params`] and the given key, so it shares the installed CA's subject and public key.
 pub fn load_ca(cert_pem: &str, key_pem: &str) -> Result<SessionCa, BoxErr> {
     let key = rcgen::KeyPair::from_pem(key_pem)?;
-    let cert = ca_params()?.self_signed(&key)?;
+    let params = ca_params()?;
+    let cert = params.self_signed(&key)?;
     Ok(SessionCa {
         cert,
-        key,
+        issuer: rcgen::Issuer::new(params, key),
         pem: cert_pem.to_string(),
     })
 }
@@ -111,7 +118,7 @@ pub fn make_leaf(ca: &SessionCa, host: &str) -> Result<Arc<CertifiedKey>, BoxErr
     let leaf_key = KeyPair::generate()?;
     let mut params = CertificateParams::new(vec![host.to_string()])?;
     params.distinguished_name.push(DnType::CommonName, host);
-    let leaf = params.signed_by(&leaf_key, &ca.cert, &ca.key)?;
+    let leaf = params.signed_by(&leaf_key, &ca.issuer)?;
 
     let leaf_der: CertificateDer<'static> = leaf.der().clone();
     let ca_der: CertificateDer<'static> = ca.cert.der().clone();
@@ -674,9 +681,13 @@ mod tests {
         // installed CA keeps validating fresh leaves as long as the issuer name + key match, which is
         // the invariant here: the reloaded keypair round-trips to the same PEM.
         let ca = generate_ca().expect("ca");
-        let key_pem = ca.key.serialize_pem();
+        let key_pem = ca.issuer.key().serialize_pem();
         let reloaded = load_ca(&ca.pem, &key_pem).expect("reload");
-        assert_eq!(key_pem, reloaded.key.serialize_pem(), "same signing key");
+        assert_eq!(
+            key_pem,
+            reloaded.issuer.key().serialize_pem(),
+            "same signing key"
+        );
         assert_eq!(ca.pem, reloaded.pem, "serves the installed cert verbatim");
         // And the reloaded CA can still mint a leaf.
         assert!(make_leaf(&reloaded, "example.com").is_ok());

@@ -40,7 +40,7 @@ fn storage_dir() -> &'static Mutex<Option<String>> {
 fn persist_ca(ca: &SessionCa) {
     if let Some(dir) = storage_dir().lock().unwrap().clone() {
         let _ = std::fs::write(format!("{dir}/ca.pem"), &ca.pem);
-        let _ = std::fs::write(format!("{dir}/ca.key"), ca.key.serialize_pem());
+        let _ = std::fs::write(format!("{dir}/ca.key"), ca.issuer.key().serialize_pem());
     }
 }
 

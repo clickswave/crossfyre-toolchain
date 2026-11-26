@@ -23,7 +23,7 @@ type Seen = Arc<Mutex<Vec<String>>>;
 fn server_config() -> Arc<rustls::ServerConfig> {
     let cert = rcgen::generate_simple_self_signed(vec![NAME.into()]).unwrap();
     let der = rustls::pki_types::CertificateDer::from(cert.cert.der().to_vec());
-    let key = rustls::pki_types::PrivateKeyDer::try_from(cert.key_pair.serialize_der()).unwrap();
+    let key = rustls::pki_types::PrivateKeyDer::try_from(cert.signing_key.serialize_der()).unwrap();
     let cfg = rustls::ServerConfig::builder_with_provider(Arc::new(
         rustls::crypto::ring::default_provider(),
     ))
