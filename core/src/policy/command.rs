@@ -140,14 +140,16 @@ pub async fn set(
 
 /// Bring this machine's copy of the account's policy up to date, as each contact with
 /// Crossfyre does: a tightening held here is sent first, then the account's is fetched.
-/// An offline machine makes no contact and keeps what it has.
+/// A run that is offline, because the machine is or because `env` (CROSSFYRE_POLICY's
+/// value) makes this run so, makes no contact and keeps what it has.
 pub async fn refresh(
     data_dir: &Path,
     session: &Session,
     cloud: &impl Cloud,
+    env: Option<&str>,
 ) -> Result<Machine, Failed> {
     let mut machine = super::load(data_dir);
-    if machine.offline.is_some() {
+    if super::in_force(&machine, env).policy == Policy::Offline {
         return Ok(machine);
     }
     if let Err(e) = sync(&mut machine, session, cloud).await {
@@ -253,10 +255,11 @@ pub async fn run_list(data_dir: &Path) -> Result<(), Box<dyn std::error::Error>>
         "Crossfyre policy",
         "what this machine may send to Crossfyre",
     );
+    let env = std::env::var(super::ENV).ok();
     let session = crate::auth::load_account(data_dir).map(|a| Session::of(&a));
     let mut note = None;
     let machine = match &session {
-        Some(s) => match refresh(data_dir, s, &super::cloud::Crossfyre).await {
+        Some(s) => match refresh(data_dir, s, &super::cloud::Crossfyre, env.as_deref()).await {
             Ok(m) => m,
             Err(Failed::NotLoggedIn(e)) => {
                 note = Some(format!(
@@ -273,7 +276,7 @@ pub async fn run_list(data_dir: &Path) -> Result<(), Box<dyn std::error::Error>>
         },
         None => super::load(data_dir),
     };
-    let run = super::in_force(&machine, std::env::var(super::ENV).ok().as_deref());
+    let run = super::in_force(&machine, env.as_deref());
     section("Policies");
     for p in ALL {
         let mark = if p == run.policy {

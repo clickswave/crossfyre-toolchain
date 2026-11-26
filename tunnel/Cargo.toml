@@ -29,4 +29,4 @@ recorder = ["tokio/rt"]
 [dev-dependencies]
 tokio = { version = "1", features = ["net", "io-util", "time", "macros", "rt", "rt-multi-thread"] }
 # A local HTTPS proxy for the TLS tests, with a certificate made on the spot.
-rcgen = "0.13"
+rcgen = "0.14"

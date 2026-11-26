@@ -15,6 +15,7 @@ use aes_gcm::{Aes256Gcm, KeyInit};
 use base64::Engine as _;
 use rand::rngs::OsRng;
 use rsa::pkcs1::DecodeRsaPublicKey;
+use rsa::traits::PublicKeyParts;
 use rsa::{Oaep, RsaPublicKey};
 use sha2::Sha256;
 
@@ -52,14 +53,26 @@ pub fn seal_to_pubkey(pubkey_der_b64: &str, plaintext: &[u8]) -> Option<String> 
     )
 }
 
-/// Whether a base64 PKCS#1-DER string parses as an RSA public key (used to reject
-/// junk registrations early).
+/// The longest registered key, in base64. A 4096-bit key, the largest the rsa
+/// crate parses, is about 700 characters.
+pub const MAX_PUBKEY_B64: usize = 1024;
+
+/// Whether a base64 PKCS#1-DER string is a public key this server will seal to
+/// (used to reject junk registrations early).
+///
+/// The key is kept as sent for the life of the registration, so its length is
+/// bounded before anything else. Its exponent must be 65537, what every RSA key
+/// generator uses: each callback is sealed to the key on the DNS responder's own
+/// time, and a large exponent is a key that makes every seal slow.
 pub fn valid_pubkey(pubkey_der_b64: &str) -> bool {
+    if pubkey_der_b64.len() > MAX_PUBKEY_B64 {
+        return false;
+    }
     base64::engine::general_purpose::STANDARD
         .decode(pubkey_der_b64.trim())
         .ok()
         .and_then(|der| RsaPublicKey::from_pkcs1_der(&der).ok())
-        .is_some()
+        .is_some_and(|key| *key.e() == rsa::BigUint::from(65_537u32))
 }
 
 #[cfg(test)]

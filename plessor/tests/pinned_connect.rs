@@ -62,7 +62,7 @@ async fn tls_listener() -> (SocketAddr, Arc<Seen>) {
     let cert = rcgen::generate_simple_self_signed(vec![NAME.into()]).expect("mint");
     let der = rustls::pki_types::CertificateDer::from(cert.cert.der().to_vec());
     let key =
-        rustls::pki_types::PrivateKeyDer::try_from(cert.key_pair.serialize_der()).expect("key");
+        rustls::pki_types::PrivateKeyDer::try_from(cert.signing_key.serialize_der()).expect("key");
     // The provider named, as in certificate_policy.rs: more than one is linked here.
     let config = rustls::ServerConfig::builder_with_provider(Arc::new(
         rustls::crypto::aws_lc_rs::default_provider(),

@@ -64,7 +64,7 @@ impl Origin {
 
 fn server_config(alpn: &[&[u8]]) -> Arc<rustls::ServerConfig> {
     let cert = rcgen::generate_simple_self_signed(vec![HOST.to_string()]).unwrap();
-    let key = rustls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
+    let key = rustls::pki_types::PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der());
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let mut config = rustls::ServerConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()

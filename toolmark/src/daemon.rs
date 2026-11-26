@@ -4,7 +4,7 @@ use crate::libs::toolmark_db::ToolmarkDb;
 use cfx_db::scans::Status;
 use serde::Deserialize;
 use serde_json::Value;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream, tcp::OwnedWriteHalf};
 use tokio::sync::mpsc;
 
@@ -69,7 +69,7 @@ async fn handle_connection(
     knowledge: std::sync::Arc<Knowledge>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (reader, mut writer) = stream.into_split();
-    let mut lines = BufReader::new(reader).lines();
+    let mut lines = dguard::Lines::new(BufReader::new(reader));
 
     while let Some(line) = lines.next_line().await? {
         let line = line.trim().to_string();
@@ -385,7 +385,7 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
-    use tokio::io::{AsyncReadExt, Lines};
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, Lines};
     use tokio::net::tcp::OwnedReadHalf;
 
     /// `reload`, as `crossfyre update` sends it after it writes new data, reads the

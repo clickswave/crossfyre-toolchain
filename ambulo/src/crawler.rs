@@ -531,7 +531,7 @@ async fn harvest_routes(
     if resp.status().is_success() {
         return;
     }
-    let Ok(body) = resp.text().await else {
+    let Ok(body) = body_text(resp).await else {
         return;
     };
     let Some(h) = crate::routetable::parse(&body) else {
@@ -1149,7 +1149,7 @@ async fn run_browser_tier(
         return;
     };
     let (browser, mut cdp) =
-        match cfx_browser::Browser::launch(&exe, cfx_browser::no_sandbox()).await {
+        match cfx_browser::Browser::launch(&exe, cfx_browser::no_sandbox(), &[]).await {
             Ok(b) => b,
             Err(e) => {
                 let _ = tx.send(CrawlEvent::note(format!(
@@ -1254,6 +1254,23 @@ async fn run_browser_tier(
 // Fetch + extract
 // ---------------------------------------------------------------------------
 
+/// The most of a response body the crawler reads, decoded. The body is the
+/// scanned target's to write, and a small gzip can inflate to gigabytes.
+pub(crate) const MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
+
+/// A response body as text, read no further than [`MAX_BODY_BYTES`].
+pub(crate) async fn body_text(mut resp: transport::Response) -> Result<String, transport::Error> {
+    let mut buf: Vec<u8> = Vec::new();
+    while let Some(chunk) = resp.chunk().await? {
+        let take = chunk.len().min(MAX_BODY_BYTES - buf.len());
+        buf.extend_from_slice(&chunk[..take]);
+        if buf.len() == MAX_BODY_BYTES {
+            break;
+        }
+    }
+    Ok(String::from_utf8_lossy(&buf).into_owned())
+}
+
 async fn fetch_page(
     client: &Client,
     url: Url,
@@ -1321,7 +1338,7 @@ async fn fetch_page(
                 || page.content_type.contains("xml")
                 || page.content_type.contains("text");
 
-            if is_texty && let Ok(body) = resp.text().await {
+            if is_texty && let Ok(body) = body_text(resp).await {
                 if is_html {
                     extract_html(&body, &mut page.links);
                     extract_input_names(&body, &mut page.params);
@@ -1442,7 +1459,7 @@ async fn probe_specs(
             if !ct.contains("json") {
                 return None;
             }
-            let body = tokio::time::timeout(std::time::Duration::from_secs(6), resp.text())
+            let body = tokio::time::timeout(std::time::Duration::from_secs(6), body_text(resp))
                 .await
                 .ok()?
                 .ok()?;
@@ -1817,7 +1834,7 @@ fn resolve_and_scope(raw: &str, base: &Url, params: &CrawlParams, seed_host: &st
     // to the node's own network: a page or a redirect that names a loopback,
     // private or link-local address is not an external site. The operator can
     // still list such a host.
-    let in_scope = listed || (params.follow_external && !is_internal_host(&host));
+    let in_scope = listed || (params.follow_external && !transport::guard::is_internal_host(&host));
     if !in_scope {
         return None;
     }
@@ -1839,14 +1856,6 @@ fn resolve_and_scope(raw: &str, base: &Url, params: &CrawlParams, seed_host: &st
     }
 
     Some(url)
-}
-
-/// A host that names this machine or its network outright: an internal address
-/// literal, or `localhost` and its subdomains, which resolve to loopback.
-fn is_internal_host(host: &str) -> bool {
-    transport::guard::is_internal_literal(host)
-        || host == "localhost"
-        || host.ends_with(".localhost")
 }
 
 fn query_keys(url: &Url) -> Vec<String> {
@@ -2576,6 +2585,7 @@ mod redirect_tests {
             "http://169.254.169.254/latest/meta-data/",
             "http://[::1]/",
             "http://localhost:3000/",
+            "http://localhost.:3000/",
             "http://api.localhost/",
         ] {
             assert_eq!(
@@ -2611,5 +2621,49 @@ mod redirect_tests {
             "an internal address nobody listed was crawled: {:?}",
             urls(&events)
         );
+    }
+}
+
+#[cfg(test)]
+mod body_cap_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// A page that never ends: a chunked body that keeps coming, as a small gzip
+    /// that inflates without end does once decoded.
+    async fn endless() -> Url {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let _ = s.read(&mut buf).await;
+                    let head = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\
+                                Transfer-Encoding: chunked\r\n\r\n";
+                    if s.write_all(head.as_bytes()).await.is_err() {
+                        return;
+                    }
+                    let chunk = format!("{:x}\r\n{}\r\n", 64 * 1024, "a".repeat(64 * 1024));
+                    while s.write_all(chunk.as_bytes()).await.is_ok() {}
+                });
+            }
+        });
+        Url::parse(&format!("http://{addr}/")).unwrap()
+    }
+
+    /// The page is the scanned target's to write, so how much of it is read is ours
+    /// to decide.
+    #[tokio::test]
+    async fn a_page_that_never_ends_is_read_only_so_far() {
+        let url = endless().await;
+        let client = transport::Client::new();
+        let page = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            fetch_page(&client, url, 0, None, false),
+        )
+        .await
+        .expect("the crawler kept reading a page with no end");
+        assert_eq!(page.status, 200);
     }
 }

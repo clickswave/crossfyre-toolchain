@@ -140,11 +140,13 @@ impl OastClient {
     /// sealed to this scan's key.
     pub async fn poll_hosts(&self, http: &Client, reg: &OastReg) -> Vec<String> {
         let mut out = Vec::new();
-        let url = format!(
-            "{}/poll?corr_id={}&secret={}",
-            self.api_base, reg.corr_id, reg.secret
-        );
-        let Ok(resp) = http.get(&url).timeout(Duration::from_secs(10)).send().await else {
+        let Ok(resp) = http
+            .post(format!("{}/poll", self.api_base))
+            .json(&json!({ "corr_id": reg.corr_id, "secret": reg.secret }))
+            .timeout(Duration::from_secs(10))
+            .send()
+            .await
+        else {
             return out;
         };
         let Ok(body) = resp.json::<Value>().await else {
@@ -187,3 +189,72 @@ impl OastClient {
 
 /// Correlation id length, must match the OAST server's `store::CORR_LEN`.
 pub const CORR_LEN: usize = 20;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::sync::{Arc, Mutex};
+
+    /// A listener that keeps each request it is sent and answers with no interactions.
+    fn api() -> (u16, Arc<Mutex<Vec<String>>>) {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let log = Arc::clone(&seen);
+        std::thread::spawn(move || {
+            for s in l.incoming() {
+                let Ok(mut s) = s else { return };
+                let mut buf = [0u8; 8192];
+                let n = s.read(&mut buf).unwrap_or(0);
+                log.lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&buf[..n]).into_owned());
+                let body = r#"{"ok":true,"count":0,"interactions":[]}"#;
+                let _ = s.write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                );
+            }
+        });
+        (port, seen)
+    }
+
+    /// The secret that authorises a poll travels in the request body, never in the URL,
+    /// which proxies and access logs keep.
+    #[tokio::test]
+    async fn a_poll_sends_its_secret_in_the_body() {
+        let (port, seen) = api();
+        let priv_key = RsaPrivateKey::new(&mut rand::thread_rng(), 1024).unwrap();
+        let oc = OastClient {
+            domains: vec!["oast.example".into()],
+            api_base: format!("http://127.0.0.1:{port}"),
+            pubkey_b64: String::new(),
+            priv_key,
+        };
+        let reg = OastReg {
+            corr_id: "abcdefghij0123456789".into(),
+            secret: "the-poll-secret".into(),
+        };
+        let http = transport::build_client(Default::default(), &transport::Egress::Direct).unwrap();
+        assert!(oc.poll_hosts(&http, &reg).await.is_empty());
+
+        let sent = seen.lock().unwrap();
+        let request = sent.first().expect("the poll reached the API");
+        let line = request.lines().next().unwrap_or("");
+        assert!(line.starts_with("POST /poll "), "{line}");
+        assert!(!line.contains("the-poll-secret"), "{line}");
+        assert!(
+            request.contains(r#""secret":"the-poll-secret""#),
+            "{request}"
+        );
+        assert!(
+            request.contains(r#""corr_id":"abcdefghij0123456789""#),
+            "{request}"
+        );
+    }
+}

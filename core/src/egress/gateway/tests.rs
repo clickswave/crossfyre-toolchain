@@ -432,7 +432,7 @@ async fn connections_that_never_authenticate_count_against_the_cap() {
 fn tls_pair(name: &str) -> (Arc<rustls::ServerConfig>, Arc<rustls::ClientConfig>) {
     let cert = rcgen::generate_simple_self_signed(vec![name.into()]).unwrap();
     let der = rustls::pki_types::CertificateDer::from(cert.cert.der().to_vec());
-    let key = rustls::pki_types::PrivateKeyDer::try_from(cert.key_pair.serialize_der()).unwrap();
+    let key = rustls::pki_types::PrivateKeyDer::try_from(cert.signing_key.serialize_der()).unwrap();
     let prov = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
     let server = rustls::ServerConfig::builder_with_provider(Arc::clone(&prov))
         .with_safe_default_protocol_versions()

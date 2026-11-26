@@ -5,7 +5,7 @@ use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use std::future::Future;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
+use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
@@ -171,7 +171,7 @@ async fn handle_connection(
     role: Role,
 ) -> Result<(), BoxError> {
     let (reader, mut writer) = stream.into_split();
-    let mut lines = BufReader::new(reader).lines();
+    let mut lines = dguard::Lines::new(BufReader::new(reader));
 
     while let Some(line) = lines.next_line().await? {
         let line = line.trim().to_string();
@@ -467,7 +467,7 @@ async fn run_op<P, F, Fut>(
     what: &str,
     run: F,
     writer: &mut OwnedWriteHalf,
-    lines: &mut Lines<BufReader<OwnedReadHalf>>,
+    lines: &mut dguard::Lines<BufReader<OwnedReadHalf>>,
     gate: &dguard::Gate,
     db: &PlessorDb,
     taken: Option<cfx_db::scans::Running>,
@@ -587,7 +587,7 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
-    use tokio::io::AsyncReadExt;
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, Lines};
 
     /// An ack names the scan when it is kept, and nothing else is touched.
     #[test]
@@ -2269,7 +2269,7 @@ mod session_tls_tests {
     use super::*;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
 
     const COOKIE: &str = "sid=SESSION-COOKIE-7f3a";
@@ -2319,8 +2319,8 @@ mod session_tls_tests {
     async fn self_signed_origin() -> (u16, Seen) {
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).expect("mint");
         let der = rustls::pki_types::CertificateDer::from(cert.cert.der().to_vec());
-        let key =
-            rustls::pki_types::PrivateKeyDer::try_from(cert.key_pair.serialize_der()).expect("key");
+        let key = rustls::pki_types::PrivateKeyDer::try_from(cert.signing_key.serialize_der())
+            .expect("key");
         let config = rustls::ServerConfig::builder_with_provider(Arc::new(
             rustls::crypto::aws_lc_rs::default_provider(),
         ))

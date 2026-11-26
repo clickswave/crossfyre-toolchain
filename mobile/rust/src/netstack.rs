@@ -7,7 +7,7 @@
 //! Compile-verified + cross-compiled to Android here; run-verification needs a device (a TUN fd only
 //! exists inside a live VpnService).
 
-use std::os::fd::{FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -18,49 +18,67 @@ use tokio::io::unix::AsyncFd;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::sync::mpsc::UnboundedSender;
 
-/// An async wrapper over the VpnService TUN fd. Each read yields exactly one raw IP packet; each write
-/// sends one. No packet-information header (Android VpnService TUN is bare IP).
-struct TunDevice {
-    /// Some until the device is dropped; see the `Drop` impl.
-    inner: Option<AsyncFd<OwnedFd>>,
-    fd: i32,
+/// The native copy of the VpnService tunnel fd.
+///
+/// Taken with [`Tunnel::dup`] while the caller still holds the original, which is
+/// what makes the number it copies the tunnel's: once start returns, the service
+/// may close its own copy at any moment, and a dup taken after that copies a
+/// closed number, or whatever the process has opened under it since.
+pub struct Tunnel {
+    /// Some until dropped; see the `Drop` impl.
+    fd: Option<OwnedFd>,
+    raw: i32,
 }
 
-impl TunDevice {
-    /// SAFETY: `fd` must be a valid TUN file descriptor from the VpnService. We `dup` it so native
-    /// owns its own copy (closed on stop) while Kotlin keeps the original ParcelFileDescriptor.
-    unsafe fn from_raw(fd: i32) -> std::io::Result<Self> {
-        let dup_fd = unsafe { dup(fd) };
-        if dup_fd < 0 {
+impl Tunnel {
+    /// SAFETY: `fd` must be an open TUN file descriptor from the VpnService for
+    /// the length of this call. Kotlin keeps the original ParcelFileDescriptor;
+    /// this copy is native's own, closed when the capture ends.
+    pub unsafe fn dup(fd: i32) -> std::io::Result<Self> {
+        let raw = unsafe { dup(fd) };
+        if raw < 0 {
             return Err(std::io::Error::last_os_error());
         }
-        // Put the dup in non-blocking mode so AsyncFd can drive it.
-        let flags = unsafe { libc_fcntl_getfl(dup_fd) };
-        unsafe { libc_fcntl_setfl(dup_fd, flags | O_NONBLOCK) };
-        let owned = unsafe { OwnedFd::from_raw_fd(dup_fd) };
-        let device = Self {
-            inner: Some(AsyncFd::new(owned)?),
-            fd: dup_fd,
-        };
-        // Recorded so Stop can let go of the tunnel without waiting for this
-        // device to be dropped. See `tunfd`.
-        crate::tunfd::hold(dup_fd);
-        Ok(device)
-    }
-
-    fn fd(&self) -> &AsyncFd<OwnedFd> {
-        self.inner
-            .as_ref()
-            .expect("the tunnel is read only while the device is alive")
+        let owned = unsafe { OwnedFd::from_raw_fd(raw) };
+        // Non-blocking, so AsyncFd can drive it.
+        let flags = unsafe { fcntl(raw, F_GETFL) };
+        if flags < 0 || unsafe { fcntl(raw, F_SETFL, flags | O_NONBLOCK) } < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // Recorded so Stop can let go of the tunnel without waiting for this to
+        // be dropped. See `tunfd`.
+        crate::tunfd::hold(raw);
+        Ok(Self {
+            fd: Some(owned),
+            raw,
+        })
     }
 }
 
-impl Drop for TunDevice {
+impl AsRawFd for Tunnel {
+    fn as_raw_fd(&self) -> i32 {
+        self.raw
+    }
+}
+
+impl Drop for Tunnel {
     fn drop(&mut self) {
         // Close under the hold's lock, so a Stop arriving now cannot act on this
         // fd number after it has been closed and possibly reused.
-        let inner = self.inner.take();
-        crate::tunfd::forget(self.fd, move || drop(inner));
+        let fd = self.fd.take();
+        crate::tunfd::forget(self.raw, move || drop(fd));
+    }
+}
+
+/// An async wrapper over the tunnel. Each read yields exactly one raw IP packet; each write
+/// sends one. No packet-information header (Android VpnService TUN is bare IP).
+struct TunDevice {
+    fd: AsyncFd<Tunnel>,
+}
+
+impl TunDevice {
+    fn fd(&self) -> &AsyncFd<Tunnel> {
+        &self.fd
     }
 }
 
@@ -80,7 +98,7 @@ impl AsyncRead for TunDevice {
             match guard.try_io(|fd| {
                 let n = unsafe {
                     read(
-                        as_raw(fd.get_ref()),
+                        fd.get_ref().as_raw_fd(),
                         unfilled.as_mut_ptr() as *mut _,
                         unfilled.len(),
                     )
@@ -115,8 +133,13 @@ impl AsyncWrite for TunDevice {
                 Poll::Pending => return Poll::Pending,
             };
             match guard.try_io(|fd| {
-                let n =
-                    unsafe { write(as_raw(fd.get_ref()), data.as_ptr() as *const _, data.len()) };
+                let n = unsafe {
+                    write(
+                        fd.get_ref().as_raw_fd(),
+                        data.as_ptr() as *const _,
+                        data.len(),
+                    )
+                };
                 if n < 0 {
                     Err(std::io::Error::last_os_error())
                 } else {
@@ -141,13 +164,19 @@ impl AsyncWrite for TunDevice {
 /// Runs until the TUN closes (VpnService stopped). UDP/QUIC flows are dropped for now (h3 is not
 /// MITM'd; they surface as metadata in a later pass).
 pub async fn run(
-    tun_fd: i32,
+    tunnel: Tunnel,
     ca: Arc<SessionCa>,
     egress: Egress,
     tx: UnboundedSender<TraceEvent>,
     capture_cfg: CaptureCfg,
 ) -> std::io::Result<()> {
-    let device = unsafe { TunDevice::from_raw(tun_fd)? };
+    // SAFETY: the AsyncFd owns the tunnel, so its fd stays open under the same
+    // number until the device is dropped. `tunfd::release` can point that number
+    // at /dev/null while it is registered; reads and writes then fail or end,
+    // which is how Stop lets go of the tunnel.
+    let device = TunDevice {
+        fd: unsafe { AsyncFd::register(tunnel) }?,
+    };
     let mut cfg = IpStackConfig::default();
     cfg.mtu = 1500;
     cfg.packet_information = false; // Android VpnService TUN is bare IP, no packet-info header.
@@ -286,15 +315,3 @@ unsafe extern "C" {
 }
 const F_GETFL: i32 = 3;
 const F_SETFL: i32 = 4;
-unsafe fn libc_fcntl_getfl(fd: i32) -> i32 {
-    unsafe { fcntl(fd, F_GETFL) }
-}
-unsafe fn libc_fcntl_setfl(fd: i32, flags: i32) {
-    unsafe {
-        fcntl(fd, F_SETFL, flags);
-    }
-}
-fn as_raw(fd: &OwnedFd) -> i32 {
-    use std::os::fd::AsRawFd;
-    fd.as_raw_fd()
-}

@@ -4,8 +4,7 @@ use crate::scanner::{Scanner, StreamEvent};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::Arc;
-use tokio::io::Lines;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream, tcp::OwnedReadHalf, tcp::OwnedWriteHalf};
 use tokio::sync::mpsc;
 use transport::Client;
@@ -361,7 +360,7 @@ async fn handle_connection(
     probe_client_noredirect: Arc<Client>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (reader, mut writer) = stream.into_split();
-    let mut lines = BufReader::new(reader).lines();
+    let mut lines = dguard::Lines::new(BufReader::new(reader));
 
     while let Some(line) = lines.next_line().await? {
         let line = line.trim().to_string();
@@ -500,7 +499,7 @@ where
 async fn handle_stream_scan(
     req: DaemonRequest,
     mut writer: OwnedWriteHalf,
-    lines: &mut Lines<BufReader<OwnedReadHalf>>,
+    lines: &mut dguard::Lines<BufReader<OwnedReadHalf>>,
     gate: &dguard::Gate,
     db: Arc<AmbuloDb>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -1320,6 +1319,7 @@ mod kept_tests {
 #[cfg(test)]
 mod not_ready_tests {
     use super::*;
+    use tokio::io::AsyncBufReadExt;
 
     /// A caller that sends its request, and words after it as a scan with a wordlist
     /// does, reads why the daemon cannot serve it yet. Closed with the request unread, the

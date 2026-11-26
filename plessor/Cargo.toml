@@ -1,6 +1,6 @@
 [package]
 name = "plessor"
-version = "0.0.36"
+version = "0.0.38"
 edition = "2024"
 license.workspace = true
 publish.workspace = true
@@ -73,7 +73,7 @@ cfx_db = { path = "../db", features = ["testing"] }
 cfx_tunnel = { path = "../tunnel", features = ["recorder"] }
 # To mint a certificate nothing trusts, which is what the certificate-policy test needs
 # an origin to present.
-rcgen = "0.13"
+rcgen = "0.14"
 
 [features]
 default = ["daemon"]

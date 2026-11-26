@@ -1,6 +1,6 @@
 [package]
 name = "toolmark"
-version = "0.0.18"
+version = "0.0.20"
 edition = "2024"
 license.workspace = true
 publish.workspace = true
@@ -45,7 +45,7 @@ cfx_tunnel = { path = "../tunnel", features = ["recorder"] }
 # A database of a test's own, for the tests of what toolmark keeps.
 cfx_db = { path = "../db", features = ["testing"] }
 # Certificates for the `tls` leaf's tests, and a server that presents one.
-rcgen = "0.13"
+rcgen = "0.14"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 # A data folder of a test's own.
 tempfile = "3"

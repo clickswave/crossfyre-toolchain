@@ -8,9 +8,9 @@
 //! than one chunk of it, so a list of millions of lines costs no more memory than a
 //! short one.
 
-use crate::Gate;
+use crate::{Gate, Lines};
 use std::path::Path;
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader, Lines};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 
 /// The scan request field that says the words follow on the connection. It holds the
 /// list's name, which is how records show it.
@@ -146,7 +146,7 @@ mod tests {
         let (mut client, daemon) = tokio::io::duplex(1 << 16);
         let path = file.to_path_buf();
         let sending = tokio::spawn(async move { send_words(&mut client, &path).await });
-        let mut lines = BufReader::new(daemon).lines();
+        let mut lines = Lines::new(BufReader::new(daemon));
         let mut chunks = WordChunks::new(&mut lines, gate);
         let mut got = Vec::new();
         while let Some(chunk) = chunks.next().await? {
@@ -201,7 +201,7 @@ mod tests {
             "{}\n",
             crate::encode_with(&serde_json::json!({"words": ["a"]}), Some("wrong"))
         );
-        let mut lines = BufReader::new(line.as_bytes()).lines();
+        let mut lines = Lines::new(BufReader::new(line.as_bytes()));
         let e = WordChunks::new(&mut lines, &gate).next().await.unwrap_err();
         assert_eq!(e, "unauthorized");
     }
@@ -209,7 +209,7 @@ mod tests {
     #[tokio::test]
     async fn a_list_cut_off_or_not_made_of_words_is_an_error() {
         let gate = Gate::default();
-        let mut lines = BufReader::new(&b"{\"words\":[\"a\"]}\n"[..]).lines();
+        let mut lines = Lines::new(BufReader::new(&b"{\"words\":[\"a\"]}\n"[..]));
         let mut chunks = WordChunks::new(&mut lines, &gate);
         assert_eq!(chunks.next().await, Ok(Some(vec!["a".to_string()])));
         assert!(
@@ -220,7 +220,7 @@ mod tests {
                 .contains("closed before the end")
         );
 
-        let mut lines = BufReader::new(&b"{\"words\":[1,2]}\n"[..]).lines();
+        let mut lines = Lines::new(BufReader::new(&b"{\"words\":[1,2]}\n"[..]));
         let e = WordChunks::new(&mut lines, &gate).next().await.unwrap_err();
         assert!(e.contains("words that are text"), "{e}");
     }

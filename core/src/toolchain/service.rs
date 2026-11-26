@@ -484,19 +484,35 @@ pub fn judge_admin_only(chain: &[Secured]) -> Result<(), String> {
 #[cfg(windows)]
 pub fn root_may_run(path: &std::path::Path) -> Result<(), String> {
     let real = std::fs::canonicalize(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let mut chain = Vec::new();
-    for p in real.ancestors() {
-        if p.as_os_str().is_empty() {
-            continue;
+    admin_only_along(path, &real, super::win::security_of)
+}
+
+/// [`judge_admin_only`] for the file `path` names, which canonicalizes to `real`, with
+/// `security_of` reading what each directory on the way allows. The path is checked as
+/// given and where its junctions and links lead, since the service is registered with
+/// it as given and either could be swapped.
+#[cfg(any(windows, test))]
+fn admin_only_along(
+    path: &std::path::Path,
+    real: &std::path::Path,
+    security_of: impl Fn(&std::path::Path) -> Result<Secured, String>,
+) -> Result<(), String> {
+    for start in [real, path] {
+        let mut chain = Vec::new();
+        for p in start.ancestors() {
+            if p.as_os_str().is_empty() {
+                continue;
+            }
+            let mut s = security_of(p)?;
+            // Shown as given rather than with the \\?\ prefix canonicalize adds.
+            if p == real {
+                s.path = path.to_path_buf();
+            }
+            chain.push(s);
         }
-        let mut s = super::win::security_of(p)?;
-        // Shown as given rather than with the \\?\ prefix canonicalize adds.
-        if p == real {
-            s.path = path.to_path_buf();
-        }
-        chain.push(s);
+        judge_admin_only(&chain)?;
     }
-    judge_admin_only(&chain)
+    Ok(())
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -1925,6 +1941,28 @@ mod tests {
         let mut renamable = chain(file(safe), bin(safe));
         renamable[3] = secured(r"C:\Program Files", TRUSTED_INSTALLER, &[(USERS, 0x0040)]);
         assert!(judge_admin_only(&renamable).is_err());
+    }
+
+    /// The service is registered with the path as given, so a junction on the way that
+    /// a user could point elsewhere is as much a way in as the file itself.
+    #[test]
+    fn a_localsystem_service_path_is_judged_as_given_too() {
+        const ADMINS: &str = "S-1-5-32-544";
+        const USER: &str = "S-1-5-21-1-2-3-1001";
+        const FULL: u32 = 0x001F_01FF;
+        // `/home/u/pf` is the user's junction to the admin-only `/pf`. Reading through it
+        // reads where it leads, as GetNamedSecurityInfoW does.
+        let security_of = |p: &Path| {
+            let theirs = p.starts_with("/home/u") && !p.starts_with("/home/u/pf");
+            let owner = if theirs { USER } else { ADMINS };
+            Ok(secured(&p.display().to_string(), owner, &[(owner, FULL)]))
+        };
+        let real = Path::new("/pf/Crossfyre/bin/node.exe");
+        assert!(admin_only_along(real, real, security_of).is_ok());
+        let given = Path::new("/home/u/pf/Crossfyre/bin/node.exe");
+        let err = admin_only_along(given, real, security_of)
+            .expect_err("a path through a junction the user owns");
+        assert!(err.contains(USER), "{err}");
     }
 
     fn owned(path: &str, uid: u32, gid: u32, mode: u32) -> PathOwner {

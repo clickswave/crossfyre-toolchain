@@ -31,7 +31,7 @@ async fn self_signed_server() -> u16 {
     let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).expect("mint");
     let der = rustls::pki_types::CertificateDer::from(cert.cert.der().to_vec());
     let key =
-        rustls::pki_types::PrivateKeyDer::try_from(cert.key_pair.serialize_der()).expect("key");
+        rustls::pki_types::PrivateKeyDer::try_from(cert.signing_key.serialize_der()).expect("key");
 
     // The provider named rather than inferred: plessor pulls in more than one rustls
     // backend through its dependency tree, so the process-level default is ambiguous and

@@ -3,8 +3,7 @@ use crate::scanner::{EnumConfig, Scanner, StreamEvent};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::Arc;
-use tokio::io::Lines;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream, tcp::OwnedReadHalf, tcp::OwnedWriteHalf};
 use tokio::sync::mpsc;
 use uuid::Uuid;
@@ -233,7 +232,7 @@ async fn handle_connection(
     db: Arc<VoyageDb>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (reader, mut writer) = stream.into_split();
-    let mut lines = BufReader::new(reader).lines();
+    let mut lines = dguard::Lines::new(BufReader::new(reader));
 
     while let Ok(Some(line)) = lines.next_line().await {
         let line = line.trim().to_string();
@@ -371,7 +370,7 @@ where
 async fn handle_stream_enum(
     req: DaemonRequest,
     mut writer: OwnedWriteHalf,
-    lines: &mut Lines<BufReader<OwnedReadHalf>>,
+    lines: &mut dguard::Lines<BufReader<OwnedReadHalf>>,
     gate: &dguard::Gate,
     db: Arc<VoyageDb>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -2050,6 +2049,37 @@ mod http_request_tests {
             !lines.iter().any(|l| l.contains("capabilities")),
             "read the body as a request: {lines:?}"
         );
+    }
+
+    /// The token is inside the line, so a line is read before anyone is known to
+    /// be allowed to send it. One that never ends must end the connection, not be
+    /// held in memory for as long as the sender keeps sending.
+    #[tokio::test]
+    async fn a_line_with_no_end_closes_the_connection() {
+        let port = daemon().await;
+        let s = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let (mut r, mut w) = s.into_split();
+        let sending = tokio::spawn(async move {
+            let chunk = vec![b'a'; 64 * 1024];
+            let mut sent = 0usize;
+            while sent < 2 * dguard::MAX_LINE {
+                if w.write_all(&chunk).await.is_err() {
+                    break;
+                }
+                sent += chunk.len();
+            }
+            w
+        });
+        let mut buf = [0u8; 4096];
+        let closed = loop {
+            match tokio::time::timeout(Duration::from_secs(10), r.read(&mut buf)).await {
+                Ok(Ok(0)) | Ok(Err(_)) => break true,
+                Ok(Ok(_)) => continue,
+                Err(_) => break false,
+            }
+        };
+        drop(sending.await);
+        assert!(closed, "the daemon kept reading a line with no end");
     }
 
     #[tokio::test]

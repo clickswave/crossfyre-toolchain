@@ -18,6 +18,11 @@ use std::sync::Mutex;
 
 static HELD: Mutex<Option<i32>> = Mutex::new(None);
 
+/// Held by every test that takes or lets go of the tunnel, since the hold is
+/// process-global and tests run on several threads.
+#[cfg(all(test, any(target_os = "linux", target_os = "android")))]
+pub static TEST_LOCK: Mutex<()> = Mutex::new(());
+
 fn held() -> std::sync::MutexGuard<'static, Option<i32>> {
     HELD.lock().unwrap_or_else(|e| e.into_inner())
 }
@@ -86,9 +91,9 @@ mod tests {
         unsafe { read(fd, b.as_mut_ptr() as *mut _, 1) }
     }
 
-    // One test: the hold is process-global and tests run on several threads.
     #[test]
     fn a_release_lets_go_of_the_tunnel_while_the_fd_stays_valid() {
+        let _held = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         // A pipe stands in for the tunnel: its read end sees end of file only once
         // every copy of the write end has gone, as the VPN goes down only once
         // every copy of the tunnel fd has.

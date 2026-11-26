@@ -71,18 +71,11 @@ fn rendering_refused(egress: &transport::Egress) -> Option<&'static str> {
     )
 }
 
-/// The documents the browser may load while rendering `target`: those of its origin,
-/// and none at an internal address when `block_internal` is set.
-fn rendering_gate(target: &transport::Url, block_internal: bool) -> cfx_browser::Gate {
+/// The documents the browser may load while rendering `target`: those of its origin.
+/// With `block_internal`, the browser itself refuses any of them at an internal address.
+fn rendering_gate(target: &transport::Url) -> cfx_browser::Gate {
     let origin = target.origin();
-    std::sync::Arc::new(move |u: &str| {
-        transport::Url::parse(u).is_ok_and(|u| {
-            u.origin() == origin
-                && !(block_internal
-                    && u.host_str()
-                        .is_some_and(transport::guard::is_internal_literal))
-        })
-    })
+    std::sync::Arc::new(move |u: &str| transport::Url::parse(u).is_ok_and(|u| u.origin() == origin))
 }
 
 /// The landing page at `url` as a browser builds it, or why it was not built.
@@ -98,10 +91,11 @@ async fn render(params: &FpParams, url: &str) -> Result<String, String> {
         );
     };
     let target = transport::Url::parse(url).map_err(|e| format!("the rendered tier: {e}"))?;
-    let (browser, mut cdp) = cfx_browser::Browser::launch(&exe, cfx_browser::no_sandbox())
-        .await
-        .map_err(|e| format!("the rendered tier could not start a browser ({e})"))?;
-    let gate = rendering_gate(&target, params.block_internal);
+    let (browser, mut cdp) =
+        cfx_browser::Browser::launch(&exe, cfx_browser::no_sandbox(), &params.resolve)
+            .await
+            .map_err(|e| format!("the rendered tier could not start a browser ({e})"))?;
+    let gate = rendering_gate(&target);
     let visit = cfx_browser::visit(&mut cdp, url, gate, params.block_internal).await;
     browser.shutdown().await;
     match visit {
@@ -972,6 +966,53 @@ mod path_tests {
         );
     }
 
+    /// The browser dials a pinned name at its pin, as the scan's own requests do, rather
+    /// than looking it up again. `.invalid` never resolves, so a page that renders came
+    /// through the pin. Skipped where no browser is found.
+    #[tokio::test]
+    async fn the_rendered_tier_loads_a_pinned_name_at_its_pin() {
+        if cfx_browser::find_browser().is_none() {
+            eprintln!("no browser on PATH; skipped");
+            return;
+        }
+        let page = "<html><body><p id=\"pinned-page\">hi</p></body></html>";
+        let (port, _) = serve(move |_, _| (200, page.to_string()));
+        let (signatures, _) = signatures::load_for_tests(&[]);
+        let params: FpParams = serde_json::from_value(json!({
+            "target": format!("http://pinned.invalid:{port}/"),
+            "resolve": [["pinned.invalid", format!("127.0.0.1:{port}")]],
+            "block_internal": true,
+            "evasive": false,
+            "timeout_ms": 3000,
+            "depth_tier": signatures::RENDERED,
+        }))
+        .unwrap();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let kept = Arc::new(Kept::default());
+        scan(
+            &signatures,
+            params,
+            tx,
+            kept.clone(),
+            &crate::knowledge::compiled_for_tests(),
+        )
+        .await;
+        let mut said = Vec::new();
+        while let Ok(e) = rx.try_recv() {
+            said.push(e);
+        }
+        let rendered: Vec<String> = kept
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(asked, _)| *asked == crate::observe::Asked::Rendered)
+            .map(|(_, body)| body.clone())
+            .collect();
+        assert_eq!(rendered.len(), 1, "{said:?}");
+        assert!(rendered[0].contains("pinned-page"), "{}", rendered[0]);
+    }
+
     /// A rendered page is read and kept no longer than a fetched body, cut where a
     /// character ends.
     #[test]
@@ -981,19 +1022,15 @@ mod path_tests {
         assert_eq!(capped("abc".into(), 8), "abc");
     }
 
-    /// The browser loads documents only from the target's origin, and no internal
-    /// address when the op refuses them.
+    /// The browser loads documents only from the target's origin.
     #[test]
     fn the_browser_renders_only_the_targets_origin() {
         let target = transport::Url::parse("http://app.example.test:8080/").unwrap();
-        let gate = rendering_gate(&target, false);
+        let gate = rendering_gate(&target);
         assert!(gate("http://app.example.test:8080/dashboard"));
         assert!(!gate("http://app.example.test/"));
         assert!(!gate("https://app.example.test:8080/"));
         assert!(!gate("http://elsewhere.test:8080/"));
-        let inside = transport::Url::parse("http://10.0.0.5/").unwrap();
-        assert!(rendering_gate(&inside, false)("http://10.0.0.5/login"));
-        assert!(!rendering_gate(&inside, true)("http://10.0.0.5/login"));
     }
 
     /// Through a proxy the browser would load the page from this machine's own

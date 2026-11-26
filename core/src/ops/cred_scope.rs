@@ -12,6 +12,7 @@
 
 use reqwest::Url;
 use serde_json::Value;
+use std::net::Ipv6Addr;
 
 /// How many skipped URLs a note names before it only counts the rest.
 const NAMED: usize = 5;
@@ -25,13 +26,26 @@ fn bare(entry: &str) -> String {
         .unwrap_or(&v);
     let v = v.strip_prefix("*.").unwrap_or(v);
     let v = v.split('/').next().unwrap_or(v);
-    // The rightmost colon only, so an IPv6 literal keeps its own.
-    match v.rsplit_once(':') {
-        Some((head, tail)) if !tail.is_empty() && tail.bytes().all(|b| b.is_ascii_digit()) => {
-            head.to_string()
-        }
+    // An IPv6 address, bare or in brackets with or without a port, is read whole and
+    // written as the URL parser writes its host, so `2001:db8::80` is not taken for
+    // `2001:db8:` on port 80.
+    if let Ok(ip) = v.parse::<Ipv6Addr>() {
+        return format!("[{ip}]");
+    }
+    if let Some((addr, after)) = v.strip_prefix('[').and_then(|r| r.split_once(']'))
+        && let Ok(ip) = addr.parse::<Ipv6Addr>()
+        && (after.is_empty() || is_port(after.strip_prefix(':').unwrap_or("")))
+    {
+        return format!("[{ip}]");
+    }
+    match v.split_once(':') {
+        Some((head, port)) if is_port(port) => head.to_string(),
         _ => v.to_string(),
     }
+}
+
+fn is_port(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
 }
 
 /// True when a credential saved for `hosts` may be sent to `host`.
@@ -244,6 +258,32 @@ mod tests {
         assert!(covers(&s(&["[::1]:8080"]), "[::1]"));
         assert!(!covers(&s(&[""]), "app.example.test."));
         assert!(covers(&[], "anything.test"));
+    }
+
+    /// An IPv6 address is one host however it is written, and two addresses are two hosts
+    /// even where one ends in what looks like a port.
+    #[test]
+    fn an_ipv6_address_is_read_whole() {
+        let h = s(&["2001:db8::80"]);
+        assert!(!covers(&h, "2001:db8::90"));
+        assert!(!covers(&h, "[2001:db8::90]"));
+        assert!(!covers(&h, "2001:db8::"));
+        assert!(covers(&h, "2001:db8::80"));
+        assert!(covers(&h, "[2001:db8::80]"));
+        assert!(covers(&h, "[2001:DB8:0::80]"));
+        assert!(covers(
+            &s(&["http://[2001:db8::80]:8080/x"]),
+            "[2001:db8::80]"
+        ));
+        assert!(covers(&s(&["[2001:db8::80]"]), "2001:db8::80"));
+        assert!(!covers(&s(&["[2001:db8::80]:8080"]), "[2001:db8::8080]"));
+
+        let mut req = json!({"seed": "http://[2001:db8::80]/", "scope_hosts": ["2001:db8::90"]});
+        crawl(&mut req, &h);
+        assert_eq!(req["scope_hosts"], json!([]));
+        let mut req = json!({"seed": "http://[2001:db8::80]/", "follow_external": true});
+        crawl(&mut req, &h);
+        assert_eq!(req["scope_hosts"], json!(["[2001:db8::80]"]));
     }
 
     /// An endpoint is read with the URL parser the engines send with, so a name before

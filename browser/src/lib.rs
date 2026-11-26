@@ -49,6 +49,7 @@
 //! lying about its coverage.
 
 use serde_json::{Value, json};
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
@@ -131,7 +132,11 @@ const DEBUGGING: &str = "--remote-debugging-port=0";
 ///
 /// Split out and tested because each one is here for a reason and a future edit
 /// that drops the wrong one turns a crawl into a data leak or a sandbox escape.
-pub fn launch_args(profile: &str, no_sandbox: bool) -> Vec<String> {
+///
+/// `pins` are names the caller has already decided the addresses of. The browser
+/// dials each at its pin, keeping the URL's port as the scan's own client does,
+/// instead of looking the name up again and being answered with somewhere else.
+pub fn launch_args(profile: &str, no_sandbox: bool, pins: &[(String, SocketAddr)]) -> Vec<String> {
     let mut a: Vec<String> = vec![
         DEBUGGING.into(),
         "--headless=new".into(),
@@ -164,7 +169,28 @@ pub fn launch_args(profile: &str, no_sandbox: bool) -> Vec<String> {
         // It is a downgrade and is named as one.
         a.push("--no-sandbox".into());
     }
+    let rules: Vec<String> = pins
+        .iter()
+        .filter(|(name, _)| is_plain_name(name))
+        .map(|(name, at)| match at.ip() {
+            IpAddr::V4(ip) => format!("MAP {} {ip}", name.to_ascii_lowercase()),
+            IpAddr::V6(ip) => format!("MAP {} [{ip}]", name.to_ascii_lowercase()),
+        })
+        .collect();
+    if !rules.is_empty() {
+        a.push(format!("--host-resolver-rules={}", rules.join(",")));
+    }
     a
+}
+
+/// A host name the browser's resolver rules can carry as it is: letters, digits,
+/// dots, hyphens and underscores. Anything else, a comma or a `*` above all, would
+/// change what the rule says, so such a pin is not passed on.
+fn is_plain_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
 }
 
 /// The preferences the throwaway profile starts with.
@@ -177,9 +203,19 @@ pub fn launch_args(profile: &str, no_sandbox: bool) -> Vec<String> {
 pub const PROFILE_PREFERENCES: &str = r#"{"net":{"network_prediction_options":2}}"#;
 
 /// Create the throwaway profile with [`PROFILE_PREFERENCES`] in place.
+///
+/// The profile comes to hold the session the browser is handed and every cookie a
+/// target sets, so on Unix it is readable by its owner alone. It is created new, and a
+/// directory that is already at the path, which another account could have made, is
+/// an error rather than a profile.
 fn write_profile(profile: &std::path::Path) -> std::io::Result<()> {
+    #[cfg_attr(not(unix), allow(unused_mut))]
+    let mut dir = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut dir, 0o700);
+    dir.create(profile)?;
     let default = profile.join("Default");
-    std::fs::create_dir_all(&default)?;
+    dir.create(&default)?;
     std::fs::write(default.join("Preferences"), PROFILE_PREFERENCES)
 }
 
@@ -201,25 +237,43 @@ const EXITED_EARLY: &str = "the browser exited before it was ready. On a contain
      usually means it needs --no-sandbox; set CFX_BROWSER_NO_SANDBOX=1 to allow that, \
      knowing it removes renderer isolation.";
 
-/// Whether the browser may be started without its sandbox: `CFX_BROWSER_NO_SANDBOX` is
-/// set, as a container whose sandbox does not start needs.
+/// Whether the browser may be started without its sandbox: `CFX_BROWSER_NO_SANDBOX=1`,
+/// as a container whose sandbox does not start needs.
 pub fn no_sandbox() -> bool {
-    std::env::var("CFX_BROWSER_NO_SANDBOX").is_ok()
+    sandbox_turned_off(std::env::var("CFX_BROWSER_NO_SANDBOX").ok().as_deref())
+}
+
+/// Only `1` turns the sandbox off. A variable that is merely set, to `0`, `false` or
+/// nothing, reads as someone meaning to keep it.
+fn sandbox_turned_off(value: Option<&str>) -> bool {
+    value.is_some_and(|v| v.trim() == "1")
 }
 
 impl Browser {
-    /// Start a browser and connect to it.
-    pub async fn launch(exe: &PathBuf, no_sandbox: bool) -> Result<(Self, Cdp), String> {
+    /// Start a browser and connect to it. `pins` are the names it dials at an address
+    /// the caller chose; see [`launch_args`].
+    pub async fn launch(
+        exe: &PathBuf,
+        no_sandbox: bool,
+        pins: &[(String, SocketAddr)],
+    ) -> Result<(Self, Cdp), String> {
         let profile = std::env::temp_dir().join(format!("cfx-browser-{}", uuid::Uuid::new_v4()));
         write_profile(&profile).map_err(|e| format!("profile dir: {e}"))?;
-        let args = launch_args(&profile.to_string_lossy(), no_sandbox);
+        let args = launch_args(&profile.to_string_lossy(), no_sandbox, pins);
         let mut cmd = Command::new(exe);
         cmd.args(&args)
             .arg("about:blank")
             .stdout(Stdio::null())
             .kill_on_drop(true);
         match start(cmd, exe).await {
-            Ok((child, cdp)) => Ok((Browser { child, profile }, cdp)),
+            Ok((child, mut cdp)) => {
+                cdp.pinned = pins
+                    .iter()
+                    .filter(|(name, _)| is_plain_name(name))
+                    .map(|(name, _)| name.to_ascii_lowercase())
+                    .collect();
+                Ok((Browser { child, profile }, cdp))
+            }
             Err(e) => {
                 // kill_on_drop has ended the process; the profile is ours to remove.
                 let _ = std::fs::remove_dir_all(&profile);
@@ -369,17 +423,15 @@ pub struct Visit {
 pub type Gate = std::sync::Arc<dyn Fn(&str) -> bool + Send + Sync>;
 
 /// Whether a request a page makes itself is failed whatever the scope says: one that
-/// is not http or https, or names an internal address outright. A page's own data and
-/// blob URLs never leave the browser, so they are let be.
+/// is not http or https, or names an internal address or `localhost` outright. A page's
+/// own data and blob URLs never leave the browser, so they are let be.
 fn refused_outright(url: &str) -> bool {
     let Ok(u) = transport::Url::parse(url) else {
         return true;
     };
     match u.scheme() {
         "data" | "blob" => false,
-        "http" | "https" => u
-            .host_str()
-            .is_none_or(transport::guard::is_internal_literal),
+        "http" | "https" => u.host_str().is_none_or(transport::guard::is_internal_host),
         _ => true,
     }
 }
@@ -478,9 +530,11 @@ pub struct Cdp {
     /// Documents the gate refused during the current visit, and requests the page made
     /// itself that were failed.
     refused: Vec<String>,
-    /// Whether a request the page makes itself is failed when its host's name resolves
-    /// to an internal address, during the current visit.
+    /// Whether a request is failed when its host's name resolves to an internal
+    /// address, during the current visit.
     block_internal: bool,
+    /// Names the browser was launched to dial at a pin, which are not looked up.
+    pinned: std::collections::HashSet<String>,
     /// What each name a page asked for resolved to, internal or not, in this visit.
     resolved: std::collections::HashMap<String, bool>,
 }
@@ -494,26 +548,39 @@ impl Cdp {
             gate: None,
             refused: Vec::new(),
             block_internal: false,
+            pinned: std::collections::HashSet::new(),
             resolved: std::collections::HashMap::new(),
         }
     }
 
     /// Whether a request the page makes itself may go out of the scope: it is http or
     /// https to no internal address, and with `block_internal` its host's name does not
-    /// resolve to one. A name that does not resolve is refused then too.
+    /// resolve to one.
     async fn may_leave_scope(&mut self, url: &str) -> bool {
-        if refused_outright(url) {
-            return false;
-        }
+        !refused_outright(url) && self.may_dial(url).await
+    }
+
+    /// Whether `url`'s host may be dialled under the visit's `block_internal`: always
+    /// without it, and with it, when the host is pinned, which is the caller's to have
+    /// checked, or its name resolves to no internal address. A name that does not
+    /// resolve is refused then too.
+    ///
+    /// The browser looks an unpinned name up again when it connects, so a name whose
+    /// records change between the two lookups can still be answered with an internal
+    /// address. Pinning the name is what closes that.
+    async fn may_dial(&mut self, url: &str) -> bool {
         if !self.block_internal {
             return true;
         }
         let Some(host) = transport::Url::parse(url)
             .ok()
-            .and_then(|u| u.host_str().map(str::to_string))
+            .and_then(|u| u.host_str().map(str::to_ascii_lowercase))
         else {
             return false;
         };
+        if self.pinned.contains(&host) {
+            return true;
+        }
         if let Some(internal) = self.resolved.get(&host) {
             return !internal;
         }
@@ -531,7 +598,8 @@ impl Cdp {
     /// Answer a paused request if `v` is one: let it through or fail it. A document goes
     /// only where the gate says. Anything else the page asks for goes where the gate says
     /// too, or out of the scope when [`Cdp::may_leave_scope`] lets it: a site's own CDN
-    /// loads, an internal address does not. Returns whether `v` was a paused request.
+    /// loads, an internal address does not. With `block_internal`, what the gate allows
+    /// is held to [`Cdp::may_dial`] as well. Returns whether `v` was a paused request.
     ///
     /// The answer is sent without waiting for its reply. Nothing is waiting on
     /// that id, so the reply is read and dropped like any other stray.
@@ -551,7 +619,11 @@ impl Cdp {
         let document =
             v.pointer("/params/resourceType").and_then(|x| x.as_str()) == Some("Document");
         let url = url.to_string();
-        let allowed = in_scope || (!document && self.may_leave_scope(&url).await);
+        let allowed = if in_scope {
+            self.may_dial(&url).await
+        } else {
+            !document && self.may_leave_scope(&url).await
+        };
         let url = url.as_str();
         let (method, params) = if allowed {
             ("Fetch.continueRequest", json!({"requestId": request_id}))
@@ -746,7 +818,8 @@ pub fn requests_from(events: &[Value]) -> Vec<(String, String)> {
 /// scripts, images and data, goes where `gate` allows, or out of it over http or
 /// https to an address that is not internal, as a browser loading the site would
 /// load its CDNs; with `block_internal`, a name that resolves to an internal address
-/// is refused as well. All of it is recorded, and what was refused is listed.
+/// is refused as well, in the scope or out of it, unless the browser was launched
+/// with a pin for it. All of it is recorded, and what was refused is listed.
 pub async fn visit(
     cdp: &mut Cdp,
     url: &str,
@@ -886,7 +959,7 @@ mod tests {
 
     #[test]
     fn the_profile_is_never_the_operators_own() {
-        let a = launch_args("/tmp/cfx-browser-abc", false);
+        let a = launch_args("/tmp/cfx-browser-abc", false, &[]);
         assert!(
             a.iter()
                 .any(|f| f == "--user-data-dir=/tmp/cfx-browser-abc")
@@ -915,7 +988,7 @@ mod tests {
 
     #[test]
     fn the_browser_does_not_phone_home() {
-        let a = launch_args("/tmp/p", false);
+        let a = launch_args("/tmp/p", false, &[]);
         for must in [
             "--disable-background-networking",
             "--disable-sync",
@@ -930,15 +1003,78 @@ mod tests {
     #[test]
     fn the_sandbox_is_on_unless_it_is_asked_off() {
         assert!(
-            !launch_args("/tmp/p", false)
+            !launch_args("/tmp/p", false, &[])
                 .iter()
                 .any(|f| f == "--no-sandbox")
         );
         assert!(
-            launch_args("/tmp/p", true)
+            launch_args("/tmp/p", true, &[])
                 .iter()
                 .any(|f| f == "--no-sandbox")
         );
+    }
+
+    #[test]
+    fn a_pinned_name_is_mapped_to_its_address_and_nothing_else_is() {
+        let at = |s: &str| s.parse::<SocketAddr>().unwrap();
+        let a = launch_args(
+            "/tmp/p",
+            false,
+            &[
+                ("App.Example.test".into(), at("203.0.113.7:443")),
+                ("v6.example.test".into(), at("[2001:db8::1]:8443")),
+                ("x.test, MAP *".into(), at("127.0.0.1:80")),
+                ("*".into(), at("127.0.0.1:80")),
+            ],
+        );
+        let rules: Vec<&String> = a
+            .iter()
+            .filter(|f| f.starts_with("--host-resolver-rules="))
+            .collect();
+        assert_eq!(
+            rules,
+            [&"--host-resolver-rules=MAP app.example.test 203.0.113.7,\
+                MAP v6.example.test [2001:db8::1]"
+                .to_string()]
+        );
+        assert!(
+            !launch_args("/tmp/p", false, &[])
+                .iter()
+                .any(|f| f.starts_with("--host-resolver-rules"))
+        );
+    }
+
+    /// Only `1` turns the sandbox off. A value meant to say no, or left empty, keeps it.
+    #[test]
+    fn only_one_turns_the_sandbox_off() {
+        assert!(sandbox_turned_off(Some("1")));
+        assert!(sandbox_turned_off(Some(" 1 ")));
+        for keeps in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("false"),
+            Some("no"),
+            Some("off"),
+        ] {
+            assert!(!sandbox_turned_off(keeps), "{keeps:?}");
+        }
+    }
+
+    /// The profile holds the session the browser is given and every cookie a target
+    /// sets, so no other account on the machine may read it, and a directory someone
+    /// else made at that path first is not used.
+    #[cfg(unix)]
+    #[test]
+    fn the_profile_is_the_owners_alone() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("cfx-browser-mode-{}", uuid::Uuid::new_v4()));
+        write_profile(&dir).unwrap();
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        let again = write_profile(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(mode, 0o700, "{mode:o}");
+        assert!(again.is_err(), "a directory already there was used");
     }
 
     #[cfg(not(unix))]
@@ -946,7 +1082,7 @@ mod tests {
     fn the_port_is_chosen_by_the_os() {
         // A fixed port races every other crawl on the machine.
         assert!(
-            launch_args("/tmp/p", false)
+            launch_args("/tmp/p", false, &[])
                 .iter()
                 .any(|f| f == "--remote-debugging-port=0")
         );
@@ -958,7 +1094,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn on_unix_the_browser_opens_no_debugging_port() {
-        let a = launch_args("/tmp/p", false);
+        let a = launch_args("/tmp/p", false, &[]);
         assert!(
             !a.iter().any(|f| f.starts_with("--remote-debugging-port")),
             "{a:?}"
@@ -976,7 +1112,9 @@ mod tests {
             eprintln!("no browser on PATH; skipped");
             return;
         };
-        let (browser, mut cdp) = Browser::launch(&exe, no_sandbox()).await.expect("launch");
+        let (browser, mut cdp) = Browser::launch(&exe, no_sandbox(), &[])
+            .await
+            .expect("launch");
         let v = visit(
             &mut cdp,
             "data:text/html,<a href=/x>x</a>",
@@ -1061,7 +1199,9 @@ mod tests {
         );
         let page_url = format!("http://127.0.0.1:{}/", page_server(page));
         let origin = page_url.clone();
-        let (browser, mut cdp) = Browser::launch(&exe, no_sandbox()).await.expect("launch");
+        let (browser, mut cdp) = Browser::launch(&exe, no_sandbox(), &[])
+            .await
+            .expect("launch");
         let scoped: Gate = std::sync::Arc::new(move |u: &str| u.starts_with(&origin));
         let guarded = visit(&mut cdp, &page_url, scoped, false).await;
         let after_guarded = (fetched.load(SeqCst), imaged.load(SeqCst));
@@ -1087,9 +1227,49 @@ mod tests {
         );
     }
 
+    /// With `block_internal`, what the scope allows is held to it too: a name in scope
+    /// that resolves to an internal address is not loaded, nor is what its page asks for.
+    /// Without it, the same visit loads, so the listeners are seen to count a request.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn block_internal_holds_the_scope_to_public_addresses_too() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let Some(exe) = find_browser() else {
+            eprintln!("no browser on PATH; skipped");
+            return;
+        };
+        let (fetched_port, fetched) = counting_listener();
+        let (page_port, paged) = counting_listener();
+        let page_url = format!("http://localhost:{page_port}/");
+        let data_url = format!("http://localhost:{fetched_port}/data");
+        let (browser, mut cdp) = Browser::launch(&exe, no_sandbox(), &[])
+            .await
+            .expect("launch");
+        let all: Gate = std::sync::Arc::new(|_: &str| true);
+        let guarded = visit(&mut cdp, &page_url, all.clone(), true).await;
+        let fetched_guarded = visit(&mut cdp, &data_url, all.clone(), true).await;
+        let literal = format!("http://127.0.0.1:{page_port}/");
+        let literal_guarded = visit(&mut cdp, &literal, all.clone(), true).await;
+        let after_guarded = (paged.load(SeqCst), fetched.load(SeqCst));
+        let opened = visit(&mut cdp, &page_url, all, false).await;
+        let after_open = paged.load(SeqCst);
+        browser.shutdown().await;
+        let guarded = guarded.expect("the guarded visit");
+        fetched_guarded.expect("the second guarded visit");
+        literal_guarded.expect("the guarded visit to an address");
+        opened.expect("the open visit");
+        assert_eq!(after_guarded, (0, 0), "refused: {:?}", guarded.refused);
+        assert!(
+            guarded.refused.iter().any(|u| u.starts_with(&page_url)),
+            "{:?}",
+            guarded.refused
+        );
+        assert!(after_open > 0, "the open visit never reached the listener");
+    }
+
     /// A request a page makes itself is failed outright when it is not http or https,
-    /// or names an internal address; a page's own data and blob URLs never leave the
-    /// browser.
+    /// or names an internal address or `localhost`; a page's own data and blob URLs
+    /// never leave the browser.
     #[test]
     fn a_subresource_is_refused_by_its_scheme_or_an_internal_address() {
         for refused in [
@@ -1097,6 +1277,10 @@ mod tests {
             "http://169.254.169.254/latest/meta-data/",
             "http://[::1]/",
             "https://10.0.0.5/app.js",
+            // Names that resolve to loopback without asking any DNS server.
+            "http://localhost:8080/admin",
+            "http://LOCALHOST./",
+            "http://app.localhost/api",
             "ftp://cdn.example.test/file",
             "file:///etc/passwd",
         ] {
@@ -1122,7 +1306,7 @@ mod tests {
             return;
         }
         let started = tokio::time::Instant::now();
-        let err = match Browser::launch(&exe, false).await {
+        let err = match Browser::launch(&exe, false, &[]).await {
             Ok(_) => panic!("a process that exits cannot be driven"),
             Err(e) => e,
         };

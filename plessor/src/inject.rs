@@ -109,8 +109,8 @@ pub struct InjectParams {
     /// with somewhere else.
     #[serde(default)]
     pub resolve: Vec<(String, std::net::SocketAddr)>,
-    /// Check certificates on every connection the pass's HTTP clients make, the
-    /// out-of-band API's included. Absent = false, which is how every pass has run: a
+    /// Check certificates on every connection the pass's HTTP clients make to the
+    /// target. The out-of-band API's client always checks them. Absent = false, which is how every pass has run: a
     /// scan has to reach hosts whose certificates are expired, self-signed or for
     /// another name. A caller that hands in a session captured where certificates were
     /// checked sets it, so the session is not sent to whoever answers the handshake for
@@ -549,7 +549,6 @@ pub async fn run(mut params: InjectParams, tx: mpsc::UnboundedSender<Value>) {
                 params.timeout_ms,
                 params.block_internal,
                 &params.egress,
-                params.verify_certs,
             ),
             &tx,
         )

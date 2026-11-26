@@ -19,3 +19,7 @@ ipstack = "1.0.1"
 serde_json = "1.0.151"
 futures = "0.3.34"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+
+[dev-dependencies]
+# Paused time, so a test of a ten-second wait does not take ten seconds.
+tokio = { version = "1.49", features = ["test-util"] }

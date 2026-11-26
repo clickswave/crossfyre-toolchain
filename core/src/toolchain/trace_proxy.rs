@@ -89,8 +89,12 @@ fn load_or_generate_ca_at(
     let _ = sudo_user::write_for_invoking_user(cert_path, ca.pem.as_bytes(), 0o644);
     // The CA private key can mint a trusted cert for ANY site: keep it owner-only. As
     // root the write sets that mode itself; otherwise it applies only to a new file.
-    if sudo_user::write_for_invoking_user(key_path, ca.key.serialize_pem().as_bytes(), 0o600)
-        .is_ok()
+    if sudo_user::write_for_invoking_user(
+        key_path,
+        ca.issuer.key().serialize_pem().as_bytes(),
+        0o600,
+    )
+    .is_ok()
         && !sudo_user::root_guards()
     {
         #[cfg(unix)]

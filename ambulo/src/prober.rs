@@ -284,10 +284,7 @@ impl Prober {
         // the body need not be read for it.
         let body_length = match valid_response.content_length() {
             Some(len) => len as i64,
-            None => match valid_response.bytes().await {
-                Ok(bytes) => bytes.len() as i64,
-                Err(_) => 0,
-            },
+            None => body_length(valid_response).await,
         };
 
         // Demote a "found" that matches the learned soft-404 wildcard (same success status and a
@@ -319,6 +316,26 @@ impl Prober {
 /// The URL a calibration probe requests: the synthetic word where a wordlist entry
 /// would go, so the baseline describes the page a real miss gets. A URL with no
 /// marker is probed beneath it.
+/// How long a body with no declared length is, counted as it arrives and not
+/// kept. Counting stops at [`crate::crawler::MAX_BODY_BYTES`]: past that, a
+/// soft-404 band has long stopped telling pages apart, and the body is the
+/// target's to make endless. 0 when the body fails part way, as it always was.
+async fn body_length(mut resp: transport::Response) -> i64 {
+    let mut seen = 0usize;
+    loop {
+        match resp.chunk().await {
+            Ok(Some(chunk)) => {
+                seen += chunk.len();
+                if seen >= crate::crawler::MAX_BODY_BYTES {
+                    return crate::crawler::MAX_BODY_BYTES as i64;
+                }
+            }
+            Ok(None) => return seen as i64,
+            Err(_) => return 0,
+        }
+    }
+}
+
 fn calibration_url(base: &str, marker: &str, word: &str) -> String {
     if base.contains(marker) {
         base.replace(marker, word)
