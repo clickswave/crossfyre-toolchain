@@ -52,7 +52,7 @@ flate2 = "1.1"
 # `relsign` dev tool so the shipped binary carries no path that produces one.
 ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
 tempfile = "3"
-sysinfo = "0.33"
+sysinfo = "0.38"
 tokio = { version = "1.49.0", features = ["rt-multi-thread", "macros", "time", "signal", "process", "io-util", "net", "sync"] }
 # The gateway a proxied node's engines send through: a SOCKS5 server for them, and a
 # client for the team proxy behind it.
@@ -88,8 +88,7 @@ tokio = { version = "1.49.0", features = ["test-util"] }
 
 # Windows: the node supervisor runs as a service (windows-service), the engines as
 # scheduled tasks registered through the Task Scheduler's COM interface (the `windows`
-# crate), and the rest is plain Win32. sysinfo 0.33 still brings windows 0.57 as well;
-# sysinfo 0.38 is the first on windows 0.62.
+# crate, at the version sysinfo already brings), and the rest is plain Win32.
 [target.'cfg(windows)'.dependencies]
 windows-service = "0.8"
 windows = { version = "0.62", features = [
