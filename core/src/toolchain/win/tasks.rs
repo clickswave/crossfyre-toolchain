@@ -31,7 +31,8 @@ use windows::Win32::System::TaskScheduler::{
     TASK_LOGON_INTERACTIVE_TOKEN, TASK_LOGON_S4U, TASK_LOGON_TYPE, TASK_STATE_DISABLED,
     TASK_STATE_QUEUED, TASK_STATE_READY, TASK_STATE_RUNNING, TaskScheduler,
 };
-use windows::core::{BSTR, VARIANT};
+use windows::Win32::System::Variant::VARIANT;
+use windows::core::BSTR;
 
 /// The task's name, in the root folder of the Task Scheduler library.
 pub fn task_name(key: &str) -> String {
