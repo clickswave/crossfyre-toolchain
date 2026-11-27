@@ -151,8 +151,8 @@ pub fn mark_op_done(op_id: &str) {
 }
 
 /// Per-workflow semaphore registry. Each workflow is sized at the user's
-/// configured `tasks` value (from step 5 of the wizard) - so a distributed port scan
-/// with tasks=2 keeps exactly 2 probes in flight at any moment, picking up
+/// configured `tasks` value (from step 5 of the wizard) - so a distributed scan
+/// with tasks=2 runs at most 2 of its ops on this node at once, picking up
 /// the next op only after one finishes or fails. The semaphore is fair-FIFO
 /// so messages drain in order.
 ///
@@ -405,7 +405,7 @@ async fn run_operation(cmd: serde_json::Value, ctx: OpCtx) {
     // per-workflow concurrency permit BEFORE claiming.
     // This keeps unclaimed ops available to other
     // nodes if this one is at capacity, and ensures
-    // we genuinely run only `tasks` probes at a time
+    // we genuinely run only `tasks` ops at a time
     // - the next op claims as soon as one finishes.
     let _ws_permit = if op_type == "network-scan-ds" || op_type == "content-discovery-ds" {
         // Port scans use `tasks`; content discovery uses
@@ -4729,7 +4729,7 @@ mod egress_tests {
         let platform = FakePlatform::start(|_, _| (500, json!({}))).await;
         let st = proxied_state(&rec);
         let c = ctx(&nats, &platform, &st).await;
-        let data = json!({"host": "127.0.0.1", "port": 22});
+        let data = json!({"targets": ["127.0.0.1"], "ports": [22], "tasks": 1});
         run(
             op("op-ps", "network-scan-ds", data),
             c,
@@ -4740,6 +4740,46 @@ mod egress_tests {
         assert_eq!(doorward.connections(), 0);
         let done = nats.first("operation_completed").unwrap();
         assert_eq!(done["error"], ops::network_scan::PROXIED, "{done}");
+    }
+
+    /// A port scan reports the ports it found open, and no filtered or closed one,
+    /// each of which the platform counted as a finding.
+    #[tokio::test]
+    async fn a_port_scan_reports_only_open_ports() {
+        let doorward = FakeEngine::start(|_| async {
+            let at = |port: u16, status: &str| {
+                json!({"type": "result", "host": "127.0.0.1", "port": port, "status": status})
+            };
+            vec![
+                at(80, "open"),
+                at(81, "filtered"),
+                at(82, "closed"),
+                json!({"type": "done"}),
+            ]
+        })
+        .await;
+        let nats = FakeNats::start().await;
+        let platform = FakePlatform::start(|_, _| (500, json!({}))).await;
+        let st = EgressState::new(resolver(&[]));
+        st.apply_authorize(&direct_settings(1));
+        let c = ctx(&nats, &platform, &st).await;
+        let data =
+            json!({"targets": ["127.0.0.1"], "ports": [80, 81, 82], "tasks": 1, "adaptive": false});
+        run(
+            op("op-open", "network-scan-ds", data),
+            c,
+            &[("doorward", doorward.port)],
+            &nats,
+        )
+        .await;
+        let reported: Vec<Value> = nats
+            .published()
+            .into_iter()
+            .map(|(_, v)| v)
+            .filter(|v| v["type"] == "result")
+            .map(|v| v["data"]["port"].clone())
+            .collect();
+        assert_eq!(reported, vec![json!(80)], "{:?}", nats.types());
     }
 
     async fn bench_lease(rec: &Recorder) -> egress::gateway::Lease {
@@ -5247,8 +5287,8 @@ mod op_failure_tests {
     }
 
     #[tokio::test]
-    async fn a_port_probe_with_doorward_down_says_so() {
-        let data = json!({"host": "127.0.0.1", "port": 22});
+    async fn a_distributed_port_scan_with_doorward_down_says_so() {
+        let data = json!({"targets": ["127.0.0.1"], "ports": [22], "tasks": 1});
         assert_failed_with_reason("network-scan-ds", "doorward", data).await;
     }
 
@@ -5517,7 +5557,7 @@ mod impostor_engine_tests {
             (
                 "network-scan-ds",
                 "doorward",
-                json!({"host": "127.0.0.1", "port": 22}),
+                json!({"targets": ["127.0.0.1"], "ports": [22], "tasks": 1}),
             ),
             (
                 "network-scan-db",
