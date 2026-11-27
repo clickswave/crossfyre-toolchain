@@ -429,6 +429,26 @@ const ADMIN_SIDS: [&str; 3] = [
     "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464",
 ];
 
+/// Whether `path` is the root of a drive or share, `C:\` or `\\?\C:\` or
+/// `\\server\share\`, read as text so it is judged the same on every platform the
+/// tests run on.
+fn is_volume_root(path: &std::path::Path) -> bool {
+    let s = path.to_string_lossy();
+    let s = s.strip_prefix(r"\\?\").unwrap_or(&s);
+    let s = s
+        .strip_prefix(r"UNC\")
+        .map(|u| format!(r"\\{u}"))
+        .unwrap_or_else(|| s.to_string());
+    let t = s.trim_end_matches('\\');
+    let b = t.as_bytes();
+    if b.len() == 2 && b[0].is_ascii_alphabetic() && b[1] == b':' {
+        return true;
+    }
+    // \\server\share, with nothing after the share.
+    t.strip_prefix(r"\\")
+        .is_some_and(|rest| rest.split('\\').filter(|c| !c.is_empty()).count() == 2)
+}
+
 /// Could anyone but an administrator replace the file whose path `chain` describes, the
 /// file first and then each directory above it? The Windows counterpart of
 /// [`judge_root_run`]. Everything on the way must be owned by an administrator. Nobody
@@ -447,11 +467,20 @@ pub fn judge_admin_only(chain: &[Secured]) -> Result<(), String> {
     const GENERIC_WRITE: u32 = 0x4000_0000;
     let take_over = DELETE | WRITE_DAC | WRITE_OWNER | GENERIC_ALL;
     for (i, p) in chain.iter().enumerate() {
-        let dangerous = match i {
+        let mut dangerous = match i {
             0 => take_over | GENERIC_WRITE | WRITE_DATA_OR_ADD_FILE | APPEND_DATA_OR_ADD_SUBDIR,
             1 => take_over | GENERIC_WRITE | WRITE_DATA_OR_ADD_FILE | DELETE_CHILD,
             _ => take_over | DELETE_CHILD,
         };
+        // A drive's root cannot be deleted or renamed, so DELETE on it reaches nothing.
+        // Some Windows images give Authenticated Users Modify on C:\ itself rather than
+        // only on what is made under it, and Modify carries DELETE: counting it refused
+        // the node service on those machines with nothing replaceable on the way.
+        // Changing the root's access list or owner, and DELETE_CHILD, which would let
+        // Program Files be renamed away, still refuse.
+        if i >= 2 && is_volume_root(&p.path) {
+            dangerous &= !DELETE;
+        }
         let why = if !ADMIN_SIDS.contains(&p.owner.as_str()) {
             Some(format!("{} belongs to {}", p.path.display(), p.owner))
         } else {
@@ -1941,6 +1970,62 @@ mod tests {
         let mut renamable = chain(file(safe), bin(safe));
         renamable[3] = secured(r"C:\Program Files", TRUSTED_INSTALLER, &[(USERS, 0x0040)]);
         assert!(judge_admin_only(&renamable).is_err());
+
+        // Some Windows images give Authenticated Users Modify on C:\ itself. Modify
+        // carries DELETE, which a drive's root cannot be used for, so the service is
+        // still admitted; the reporter's machine, 27 Nov 2026.
+        const MODIFY: u32 = 0x0013_01BF;
+        for root in [r"C:\", r"\\?\C:\"] {
+            let mut modify_on_root = chain(file(safe), bin(safe));
+            modify_on_root[4] = secured(
+                root,
+                TRUSTED_INSTALLER,
+                &[
+                    (ADMINS, FULL),
+                    (AUTHENTICATED, MODIFY),
+                    (USERS, READ_EXECUTE),
+                ],
+            );
+            assert!(judge_admin_only(&modify_on_root).is_ok(), "{root}");
+        }
+        // The same Modify on Program Files is a way in: it can be renamed away.
+        let mut modify_on_program_files = chain(file(safe), bin(safe));
+        modify_on_program_files[3] = secured(
+            r"C:\Program Files",
+            TRUSTED_INSTALLER,
+            &[(AUTHENTICATED, MODIFY)],
+        );
+        assert!(judge_admin_only(&modify_on_program_files).is_err());
+        // And on the root, rewriting its access list or deleting its children still is.
+        for mask in [0x0004_0000, 0x0040] {
+            let mut root_taken = chain(file(safe), bin(safe));
+            root_taken[4] = secured(r"C:\", TRUSTED_INSTALLER, &[(AUTHENTICATED, mask)]);
+            assert!(judge_admin_only(&root_taken).is_err(), "{mask:#x}");
+        }
+    }
+
+    #[test]
+    fn a_volume_root_is_known_by_its_text() {
+        for root in [
+            r"C:\",
+            r"C:",
+            r"\\?\C:\",
+            r"\\?\d:\",
+            r"\\server\share",
+            r"\\server\share\",
+            r"\\?\UNC\server\share\",
+        ] {
+            assert!(is_volume_root(std::path::Path::new(root)), "{root}");
+        }
+        for not in [
+            r"C:\Program Files",
+            r"\\?\C:\Program Files",
+            r"\\server\share\dir",
+            r"relative",
+            r"\\server",
+        ] {
+            assert!(!is_volume_root(std::path::Path::new(not)), "{not}");
+        }
     }
 
     /// The service is registered with the path as given, so a junction on the way that
