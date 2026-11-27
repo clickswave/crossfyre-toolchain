@@ -1007,15 +1007,18 @@ fn scan_nodes(
 ) -> Result<(Vec<String>, Vec<String>), Box<dyn std::error::Error>> {
     if !base.exists() {
         return Err(format!(
-            "config root {base:?} does not exist. Run `crossfyre node init` first."
+            "config root {} does not exist. Run `crossfyre node init` first.",
+            base.display()
         )
         .into());
     }
     let nd = nodes_dir(base);
     if !nd.is_dir() {
-        return Err(
-            format!("{nd:?} is missing. Run `crossfyre node init` to register a node.").into(),
-        );
+        return Err(format!(
+            "{} is missing. Run `crossfyre node init` to register a node.",
+            nd.display()
+        )
+        .into());
     }
 
     let mut ids = Vec::new();
@@ -1046,8 +1049,10 @@ fn scan_nodes(
             Ok(s) => match toml::from_str::<Config>(&s) {
                 Ok(_) => ids.push(stem.to_string()),
                 Err(e) => {
-                    let line =
-                        format!("[boot] WARNING: skipping {path:?} - not a valid node config: {e}");
+                    let line = format!(
+                        "[boot] WARNING: skipping {} - not a valid node config: {e}",
+                        path.display()
+                    );
                     skipped.push((path, line));
                 }
             },
@@ -1059,7 +1064,7 @@ fn scan_nodes(
                 ids.push(stem.to_string())
             }
             Err(e) => {
-                let line = format!("[boot] WARNING: skipping {path:?}: {e}");
+                let line = format!("[boot] WARNING: skipping {}: {e}", path.display());
                 skipped.push((path, line));
             }
         }
@@ -1143,7 +1148,7 @@ pub async fn run_boot(
     force: bool,
     base: &std::path::Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    println!("Booting Crossfyre nodes from {base:?}...");
+    println!("Booting Crossfyre nodes from {}...", base.display());
 
     // The engines run as units of the user's service manager, or where none runs, as
     // this supervisor's children (see toolchain::node_engines).
@@ -1164,11 +1169,18 @@ pub async fn run_boot(
         }
     }
 
+    // Every node daemon refuses to run without elevation, so the supervisor says so
+    // and stops here. Left to the daemons, each one exited at once and the
+    // supervisor held it and waited for ever, with no node running.
+    if !os::is_elevated() && std::env::var("CFX_ALLOW_UNPRIV_DAEMON").is_err() {
+        print_privilege_banner(true);
+    }
+
     let node_ids = discover_nodes(base)?;
     if node_ids.is_empty() {
         eprintln!(
-            "No nodes registered under {:?}.\nRegister one with: crossfyre node init",
-            nodes_dir(base)
+            "No nodes registered under {}.\nRegister one with: crossfyre node init",
+            nodes_dir(base).display()
         );
         std::process::exit(1);
     }
@@ -1209,9 +1221,9 @@ pub async fn run_boot(
     rescan.tick().await; // consume the immediate first tick
 
     println!(
-        "[boot] Supervising {} daemon(s); watching {:?} for changes. Press Ctrl+C to stop all.",
+        "[boot] Supervising {} daemon(s); watching {} for changes. Press Ctrl+C to stop all.",
         children.len(),
-        nodes_dir(base)
+        nodes_dir(base).display()
     );
 
     // Supervise loop: reconcile running children against nodes.d on every
@@ -2546,8 +2558,9 @@ pub async fn run_daemon(
 
     if !config_path.exists() {
         eprintln!(
-            "Configuration for node '{}' not found. Run `crossfyre node init` first. Expected at: {:?}",
-            paths.node_id, config_path
+            "Configuration for node '{}' not found. Run `crossfyre node init` first. Expected at: {}",
+            paths.node_id,
+            config_path.display()
         );
         std::process::exit(1);
     }

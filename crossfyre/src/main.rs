@@ -589,6 +589,27 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     {
         cfx_core::os::rerun_as_root(command);
     }
+    // Windows has no sudo to run it again with, so the command says what it needs
+    // before it starts. Without this, an extension was downloaded and then failed to
+    // be moved into place with a bare "Access is denied".
+    #[cfg(windows)]
+    if !cfx_core::os::is_elevated()
+        && let Some(command) = needs_root(
+            &cli.command,
+            &cfx_core::toolchain::install::may_replace_binaries,
+        )
+    {
+        eprintln!(
+            "crossfyre {command} needs an administrator. Open a terminal with Run as administrator and run it there."
+        );
+        if replaces_binaries(command) {
+            eprintln!(
+                "It changes the programs in {}, which only an administrator may write to.",
+                cfx_core::toolchain::config::get_bin_dir().display()
+            );
+        }
+        std::process::exit(1);
+    }
     let base = cfx_core::resolve_data_dir(cli.data_dir.as_deref())?;
     // Make --data-dir mean what it says: config.toml lives under the same root
     // as nodes.d and auth.toml, so an isolated node set gets its own database
@@ -1014,12 +1035,12 @@ fn when_offline(cmd: &Commands) -> Offline {
 }
 
 /// The command as a person names it, as `node init`, when it needs root on Linux and
-/// macOS, where it then runs itself again through sudo. The node service, the node's
+/// macOS, where it then runs itself again through sudo, or an elevated prompt on
+/// Windows, where it says so and stops. The node service, the node's
 /// configs (which only root may change, and which `node remove` reads and deletes),
 /// uninstall and the OAST service always need it. `update` and the commands that install
 /// or remove an engine need it when this user may not replace what is in the bin
 /// directory, as in the installer's /opt/crossfyre/bin: `binaries_writable` says.
-#[cfg(unix)]
 fn needs_root(command: &Commands, binaries_writable: &dyn Fn() -> bool) -> Option<&'static str> {
     match command {
         Commands::Node { action } => match action {
@@ -1060,6 +1081,15 @@ fn needs_root(command: &Commands, binaries_writable: &dyn Fn() -> bool) -> Optio
         },
         _ => None,
     }
+}
+
+/// Whether `command`, as [`needs_root`] names it, needs root only for the bin directory.
+#[cfg(any(windows, test))]
+fn replaces_binaries(command: &str) -> bool {
+    matches!(
+        command,
+        "update" | "extension install" | "extension remove" | "extension update"
+    )
 }
 
 /// Write `bytes` to stdout. A reader that stops early, as `head` does, closes the pipe,
@@ -1161,6 +1191,23 @@ mod tests {
             for writable in [false, true] {
                 assert_eq!(root_for(args, writable), Some(name), "{args:?}");
             }
+        }
+    }
+
+    #[test]
+    fn what_names_the_bin_directory_is_what_needs_root_only_for_it() {
+        for args in [
+            &["update"][..],
+            &["extension", "install", "voyage"],
+            &["extension", "remove", "voyage"],
+            &["extension", "update"],
+            &["node", "up"],
+            &["node", "init"],
+            &["uninstall", "--yes"],
+        ] {
+            let only_for_bins = root_for(args, true).is_none();
+            let named = root_for(args, false).expect("needs root");
+            assert_eq!(replaces_binaries(named), only_for_bins, "{args:?}");
         }
     }
 
