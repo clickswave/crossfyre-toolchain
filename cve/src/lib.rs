@@ -97,13 +97,13 @@ pub struct Known {
     pub severity: Option<String>,
     /// CVSS base score.
     #[serde(default)]
-    pub score: Option<f32>,
+    pub score: Option<f64>,
     /// On CISA's known-exploited list.
     #[serde(default)]
     pub kev: bool,
     /// EPSS: the chance it is exploited in the next 30 days.
     #[serde(default)]
-    pub epss: Option<f32>,
+    pub epss: Option<f64>,
 }
 
 /// A CVE that may affect what was fingerprinted: a lead to check, never a confirmed
@@ -536,6 +536,14 @@ impl<'de> Visitor<'de> for CvesSeed<'_> {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn a_score_prints_as_the_dataset_gives_it() {
+        let known: Known =
+            serde_json::from_str(r#"{"severity":"critical","score":9.8,"epss":0.94358}"#).unwrap();
+        let out = serde_json::json!({ "cvss": known.score, "epss": known.epss }).to_string();
+        assert_eq!(out, r#"{"cvss":9.8,"epss":0.94358}"#);
+    }
 
     /// A hand-made dataset: Apache's two path-traversal CVEs and OpenSSH's regreSSHion as
     /// their advisories give them, and made-up products that share or split a CVE.

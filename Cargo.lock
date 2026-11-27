@@ -733,7 +733,7 @@ checksum = "f079e83a288787bcd14a6aea84cee5c87a67c5a3e660c30f557a3d24761b3527"
 
 [[package]]
 name = "cfx-script"
-version = "0.1.16"
+version = "0.1.17"
 dependencies = [
  "cfx_core",
  "dguard",
@@ -1366,7 +1366,7 @@ checksum = "61803da095bee82a81bb1a452ecc25d3b2f1416d1897eb86430c6159ef717c17"
 
 [[package]]
 name = "crossfyre"
-version = "0.1.47"
+version = "0.1.48"
 dependencies = [
  "cfx_bridge",
  "cfx_core",
@@ -3179,7 +3179,7 @@ dependencies = [
 
 [[package]]
 name = "node"
-version = "0.1.57"
+version = "0.1.58"
 dependencies = [
  "cfx_core",
  "cfx_pacing",
@@ -3683,7 +3683,7 @@ checksum = "b4596b6d070b27117e987119b4dac604f3c58cfb0b191112e24771b2faeac1a6"
 
 [[package]]
 name = "plessor"
-version = "0.0.38"
+version = "0.0.39"
 dependencies = [
  "adaptive",
  "aes-gcm",
@@ -5665,7 +5665,7 @@ checksum = "009dbb7700f11c55ef83aebbe4c0e9cf1f1ac0844bd8d6f00dc38f302026e13a"
 
 [[package]]
 name = "toolmark"
-version = "0.0.20"
+version = "0.0.21"
 dependencies = [
  "adaptive",
  "base64 0.22.1",

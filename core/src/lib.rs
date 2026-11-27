@@ -151,8 +151,8 @@ pub fn mark_op_done(op_id: &str) {
 }
 
 /// Per-workflow semaphore registry. Each workflow is sized at the user's
-/// configured `tasks` value (from step 5 of the wizard) - so a distributed port scan
-/// with tasks=2 keeps exactly 2 probes in flight at any moment, picking up
+/// configured `tasks` value (from step 5 of the wizard) - so a distributed scan
+/// with tasks=2 runs at most 2 of its ops on this node at once, picking up
 /// the next op only after one finishes or fails. The semaphore is fair-FIFO
 /// so messages drain in order.
 ///
@@ -405,7 +405,7 @@ async fn run_operation(cmd: serde_json::Value, ctx: OpCtx) {
     // per-workflow concurrency permit BEFORE claiming.
     // This keeps unclaimed ops available to other
     // nodes if this one is at capacity, and ensures
-    // we genuinely run only `tasks` probes at a time
+    // we genuinely run only `tasks` ops at a time
     // - the next op claims as soon as one finishes.
     let _ws_permit = if op_type == "network-scan-ds" || op_type == "content-discovery-ds" {
         // Port scans use `tasks`; content discovery uses
@@ -1007,15 +1007,18 @@ fn scan_nodes(
 ) -> Result<(Vec<String>, Vec<String>), Box<dyn std::error::Error>> {
     if !base.exists() {
         return Err(format!(
-            "config root {base:?} does not exist. Run `crossfyre node init` first."
+            "config root {} does not exist. Run `crossfyre node init` first.",
+            base.display()
         )
         .into());
     }
     let nd = nodes_dir(base);
     if !nd.is_dir() {
-        return Err(
-            format!("{nd:?} is missing. Run `crossfyre node init` to register a node.").into(),
-        );
+        return Err(format!(
+            "{} is missing. Run `crossfyre node init` to register a node.",
+            nd.display()
+        )
+        .into());
     }
 
     let mut ids = Vec::new();
@@ -1046,8 +1049,10 @@ fn scan_nodes(
             Ok(s) => match toml::from_str::<Config>(&s) {
                 Ok(_) => ids.push(stem.to_string()),
                 Err(e) => {
-                    let line =
-                        format!("[boot] WARNING: skipping {path:?} - not a valid node config: {e}");
+                    let line = format!(
+                        "[boot] WARNING: skipping {} - not a valid node config: {e}",
+                        path.display()
+                    );
                     skipped.push((path, line));
                 }
             },
@@ -1059,7 +1064,7 @@ fn scan_nodes(
                 ids.push(stem.to_string())
             }
             Err(e) => {
-                let line = format!("[boot] WARNING: skipping {path:?}: {e}");
+                let line = format!("[boot] WARNING: skipping {}: {e}", path.display());
                 skipped.push((path, line));
             }
         }
@@ -1143,7 +1148,7 @@ pub async fn run_boot(
     force: bool,
     base: &std::path::Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    println!("Booting Crossfyre nodes from {base:?}...");
+    println!("Booting Crossfyre nodes from {}...", base.display());
 
     // The engines run as units of the user's service manager, or where none runs, as
     // this supervisor's children (see toolchain::node_engines).
@@ -1164,11 +1169,18 @@ pub async fn run_boot(
         }
     }
 
+    // Every node daemon refuses to run without elevation, so the supervisor says so
+    // and stops here. Left to the daemons, each one exited at once and the
+    // supervisor held it and waited for ever, with no node running.
+    if !os::is_elevated() && std::env::var("CFX_ALLOW_UNPRIV_DAEMON").is_err() {
+        print_privilege_banner(true);
+    }
+
     let node_ids = discover_nodes(base)?;
     if node_ids.is_empty() {
         eprintln!(
-            "No nodes registered under {:?}.\nRegister one with: crossfyre node init",
-            nodes_dir(base)
+            "No nodes registered under {}.\nRegister one with: crossfyre node init",
+            nodes_dir(base).display()
         );
         std::process::exit(1);
     }
@@ -1209,9 +1221,9 @@ pub async fn run_boot(
     rescan.tick().await; // consume the immediate first tick
 
     println!(
-        "[boot] Supervising {} daemon(s); watching {:?} for changes. Press Ctrl+C to stop all.",
+        "[boot] Supervising {} daemon(s); watching {} for changes. Press Ctrl+C to stop all.",
         children.len(),
-        nodes_dir(base)
+        nodes_dir(base).display()
     );
 
     // Supervise loop: reconcile running children against nodes.d on every
@@ -2546,8 +2558,9 @@ pub async fn run_daemon(
 
     if !config_path.exists() {
         eprintln!(
-            "Configuration for node '{}' not found. Run `crossfyre node init` first. Expected at: {:?}",
-            paths.node_id, config_path
+            "Configuration for node '{}' not found. Run `crossfyre node init` first. Expected at: {}",
+            paths.node_id,
+            config_path.display()
         );
         std::process::exit(1);
     }
@@ -4716,7 +4729,7 @@ mod egress_tests {
         let platform = FakePlatform::start(|_, _| (500, json!({}))).await;
         let st = proxied_state(&rec);
         let c = ctx(&nats, &platform, &st).await;
-        let data = json!({"host": "127.0.0.1", "port": 22});
+        let data = json!({"targets": ["127.0.0.1"], "ports": [22], "tasks": 1});
         run(
             op("op-ps", "network-scan-ds", data),
             c,
@@ -4727,6 +4740,46 @@ mod egress_tests {
         assert_eq!(doorward.connections(), 0);
         let done = nats.first("operation_completed").unwrap();
         assert_eq!(done["error"], ops::network_scan::PROXIED, "{done}");
+    }
+
+    /// A port scan reports the ports it found open, and no filtered or closed one,
+    /// each of which the platform counted as a finding.
+    #[tokio::test]
+    async fn a_port_scan_reports_only_open_ports() {
+        let doorward = FakeEngine::start(|_| async {
+            let at = |port: u16, status: &str| {
+                json!({"type": "result", "host": "127.0.0.1", "port": port, "status": status})
+            };
+            vec![
+                at(80, "open"),
+                at(81, "filtered"),
+                at(82, "closed"),
+                json!({"type": "done"}),
+            ]
+        })
+        .await;
+        let nats = FakeNats::start().await;
+        let platform = FakePlatform::start(|_, _| (500, json!({}))).await;
+        let st = EgressState::new(resolver(&[]));
+        st.apply_authorize(&direct_settings(1));
+        let c = ctx(&nats, &platform, &st).await;
+        let data =
+            json!({"targets": ["127.0.0.1"], "ports": [80, 81, 82], "tasks": 1, "adaptive": false});
+        run(
+            op("op-open", "network-scan-ds", data),
+            c,
+            &[("doorward", doorward.port)],
+            &nats,
+        )
+        .await;
+        let reported: Vec<Value> = nats
+            .published()
+            .into_iter()
+            .map(|(_, v)| v)
+            .filter(|v| v["type"] == "result")
+            .map(|v| v["data"]["port"].clone())
+            .collect();
+        assert_eq!(reported, vec![json!(80)], "{:?}", nats.types());
     }
 
     async fn bench_lease(rec: &Recorder) -> egress::gateway::Lease {
@@ -5234,8 +5287,8 @@ mod op_failure_tests {
     }
 
     #[tokio::test]
-    async fn a_port_probe_with_doorward_down_says_so() {
-        let data = json!({"host": "127.0.0.1", "port": 22});
+    async fn a_distributed_port_scan_with_doorward_down_says_so() {
+        let data = json!({"targets": ["127.0.0.1"], "ports": [22], "tasks": 1});
         assert_failed_with_reason("network-scan-ds", "doorward", data).await;
     }
 
@@ -5504,7 +5557,7 @@ mod impostor_engine_tests {
             (
                 "network-scan-ds",
                 "doorward",
-                json!({"host": "127.0.0.1", "port": 22}),
+                json!({"targets": ["127.0.0.1"], "ports": [22], "tasks": 1}),
             ),
             (
                 "network-scan-db",
