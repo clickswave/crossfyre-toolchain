@@ -77,8 +77,8 @@ android {
         applicationId = "io.crossfyre.mobile"
         minSdk = 26
         targetSdk = 36
-        versionCode = 28
-        versionName = "0.4.1"
+        versionCode = 29
+        versionName = "0.4.2"
         // arm64 for real devices, x86_64 for the emulator.
         ndk { abiFilters += listOf("arm64-v8a", "x86_64") }
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
